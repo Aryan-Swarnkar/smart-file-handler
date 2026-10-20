@@ -1,4 +1,3 @@
-
 import mimetypes
 import uuid
 from pathlib import Path
@@ -54,7 +53,7 @@ def register_user(db: Session, data: UserCreate) -> UserModel:
             status_code=status.HTTP_409_CONFLICT,
             detail="Email is already registered",
         )
-
+        
 
 def login_user(
     db: Session,

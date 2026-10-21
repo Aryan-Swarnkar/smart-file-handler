@@ -1,7 +1,8 @@
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from sqlalchemy import create_engine
+from settings import settings
 
-DATABASE_URL="postgresql+psycopg://postgres:iamnotaryan@localhost:5432/smart_file_handler"
+DATABASE_URL=f"postgresql+psycopg://postgres:{settings.DATABASE_PASSWORD}@localhost:5432/smart_file_handler"
 
 engine = create_engine(
     DATABASE_URL
@@ -16,6 +17,8 @@ def get_db():
     try:
         yield db
     except:
+        db.close()
+    finally:
         db.close()
 
 

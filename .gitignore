@@ -1,90 +1,12 @@
-# ==========================================
-# FastAPI & Application Specific
-# ==========================================
-.env
-.env.*
-!.env.example
-*.log
-*.db
-*.sqlite3
-
-# ==========================================
-# Python Byte-compiled / Optimized Files
-# ==========================================
+# Python-generated files
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# ==========================================
-# Virtual Environments
-# ==========================================
-.venv/
-venv/
-env/
-ENV/
-*.venv
-
-# ==========================================
-# Dependency & Packaging
-# ==========================================
-# Poetry (if using poetry)
-.poetry/
-dist/
-
-# Pipenv (uncomment Pipfile.lock if you want to avoid locking it, though usually tracked)
-# Pipfile.lock
-
-# General packaging
+*.py[oc]
 build/
-develop-eggs/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
+dist/
 wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+*.egg-info
 
-# ==========================================
-# Testing & Coverage
-# ==========================================
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# ==========================================
-# IDEs and Editors
-# ==========================================
-# VS Code
-.vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-*.code-workspace
-
-# PyCharm / JetBrains
-.idea/
-
-# ==========================================
-# OS Specific
-# ==========================================
-.DS_Store
-Thumbs.db
+# Virtual environments
+.venv
+.env
+storage/

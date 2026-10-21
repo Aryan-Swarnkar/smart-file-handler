@@ -1,6 +1,6 @@
-from fastapi import FastAPI
-from routes import router
+def main():
+    print("Hello from beta!")
 
-app = FastAPI(title="Smart File Handler")
 
-app.include_router(router)
+if __name__ == "__main__":
+    main()

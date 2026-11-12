@@ -9,4 +9,16 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local ML model weights (downloaded by the worker, never committed)
+models-cache/
+
+# Object storage volume when not using named docker volumes
 storage/

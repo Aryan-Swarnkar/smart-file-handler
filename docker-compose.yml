@@ -1,20 +1,94 @@
 services:
-  db:
-    image: postgres:16
+  postgres:
+    # pgvector build of PG16 — required for face embedding columns (P1).
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-file_service}
+      POSTGRES_DB: ${POSTGRES_DB:-smart_file_handler}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
-      - "5432:5432"
+      - "5433:5432" # host 5432 is taken by a stale stage-1 container (beta-db-1)
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  s3:
+    # SeaweedFS stands in for MinIO: MinIO community edition was discontinued
+    # (images/binaries gone from Docker Hub, quay.io and dl.min.io; repo
+    # archived). User-approved substitution. Production uses S3/R2 via
+    # aioboto3; only this dev container differs. S3 API on 8333, master UI 9333.
+    image: chrislusf/seaweedfs:3.99
+    restart: unless-stopped
+    command:
+      - "server"
+      - "-dir=/data"
+      - "-ip.bind=0.0.0.0" # default binds container IP only -> breaks healthcheck
+      - "-s3"
+      - "-s3.port=8333"
+      - "-s3.config=/etc/seaweedfs/s3.json"
+    ports:
+      - "9000:8333" # host 9000 => .env S3_ENDPOINT_URL stays http://localhost:9000
+      - "9333:9333"
+    volumes:
+      - s3_data:/data
+      - ./deploy/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9333/cluster/status || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      target: api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      SECRET_KEY: ${SECRET_KEY}
+      # Container-internal hostnames override the .env (env vars beat dotenv).
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-smart_file_handler}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://s3:8333
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-smart-file-handler}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
 
 volumes:
   postgres_data:
+  redis_data:
+  s3_data:

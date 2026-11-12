@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
+
+from app.main import create_app
 
 
 async def test_healthz_ok(client: AsyncClient) -> None:
@@ -34,10 +37,23 @@ async def test_unknown_route_returns_envelope(client: AsyncClient) -> None:
     assert body["request_id"] == resp.headers["x-request-id"]
 
 
-async def test_readyz_reports_redis_down(client: AsyncClient) -> None:
-    # conftest points REDIS_URL at a closed port, so readiness must be 503
-    # and name the failing dependency.
-    resp = await client.get("/readyz")
+async def test_readyz_reports_redis_down() -> None:
+    """Dependency-down readiness: a dead Redis client must yield 503 + names.
+
+    conftest now points REDIS_URL at the real compose redis (auth tests need
+    it), so this test swaps in a dead client AFTER lifespan startup.
+    """
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        app.state.redis = Redis.from_url(
+            "redis://127.0.0.1:1/0",  # closed port
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            resp = await ac.get("/readyz")
     assert resp.status_code == 503
     assert resp.json()["checks"]["redis"] == "down"
 

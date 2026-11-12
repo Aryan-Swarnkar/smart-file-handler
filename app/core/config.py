@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    # --- rate limiting (auth endpoints; per client IP, fixed window) -----------
+    # Namespace isolates key spaces (multi-replica shares Redis; tests get a
+    # unique per-run namespace so rate-limit counters never leak between runs).
+    RATELIMIT_NAMESPACE: str = "rl"
+    LOGIN_RATELIMIT_PER_MINUTE: int = 10
+    REGISTER_RATELIMIT_PER_MINUTE: int = 5
+
     # --- infrastructure ------------------------------------------------------
     DATABASE_URL: str
     REDIS_URL: str = "redis://localhost:6379/0"

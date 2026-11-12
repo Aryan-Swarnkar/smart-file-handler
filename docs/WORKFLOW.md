@@ -10,34 +10,43 @@ Reading order convention:
 
 ---
 
-## System map (current: after Phase 1)
+## System map (current: after Phase 2)
 
 ```
 Browser/curl ──HTTP──▶ API (uvicorn, FastAPI) ──▶ structlog JSON logs
                         │            │
-                        │            ├─▶ Redis (readiness ping)
-                        │            ├─▶ PostgreSQL 16+pgvector (SELECT 1 + future ORM)
+                        │            ├─▶ Redis (readiness ping, auth rate limits)
+                        │            ├─▶ PostgreSQL 16+pgvector (SELECT 1 + auth ORM)
                         │            └─▶ SeaweedFS S3 API (unused yet, P3)
                         └─▶ /metrics (prometheus-client)
 ```
 
-## File responsibility map (current: after Phase 1)
+## File responsibility map (current: after Phase 2)
 
 | File | Owns | Used by |
 |---|---|---|
 | `app/core/config.py` | `Settings` class + `get_settings()`; all env parsing; production secret validation | everything (never imports other app modules) |
 | `app/core/logging.py` | `configure_logging()` (structlog JSON/console), `RequestIdMiddleware` (pure ASGI), `get_logger()`, `request_id_var` contextvar | main, errors |
-| `app/core/errors.py` | Domain exception classes + `install_error_handlers()` → one JSON envelope | main (wires once) |
+| `app/core/errors.py` | Domain exception classes (+`headers`, e.g. Retry-After) + `install_error_handlers()` → one JSON envelope | main (wires once) |
 | `app/api/routers/health.py` | `/healthz`, `/readyz` (redis + db), `/` index routes | main |
+| `app/api/routers/auth.py` | `/auth/register|login|refresh|logout|me` — HTTP shapes only, delegates to AuthService | main |
+| `app/api/deps.py` | `get_current_user` (Bearer→JWT→User), `rate_limit()` factory, `auth_service` provider, `get_redis` | auth router (all protected routers P3+) |
+| `app/schemas/auth.py` | Request/response models (SecretStr, EmailStr, TokenPair) | auth router |
+| `app/repositories/users.py` | All `users` table queries | AuthService |
+| `app/repositories/refresh_tokens.py` | Token lookup by hash, create, revoke, family nuke | AuthService |
+| `app/services/security.py` | argon2 hash/verify + dummy-verify, JWT create/decode, refresh token material (SHA-256 only stored) | AuthService, deps |
+| `app/services/auth.py` | register/login/refresh(rotation+reuse)/logout business rules; one commit per operation | deps |
+| `app/services/rate_limit.py` | Redis fixed-window limiter (INCR+EXPIRE), fail-open policy | deps |
 | `app/db/base.py` | `Base(DeclarativeBase)` + constraint naming convention + `CreatedAtMixin` | all models |
-| `app/db/session.py` | `engine` (create_async_engine), `session_factory`, `get_session` dependency | health now; every router P2+ |
-| `app/db/models/*.py` | 7 ORM models (User, RefreshToken, File, Person, FaceInstance, Label, FileLabel) | Alembic metadata, P2+ repositories |
+| `app/db/session.py` | `engine` (create_async_engine), `session_factory`, `get_session` dependency | every router |
+| `app/db/models/*.py` | 7 ORM models (User, RefreshToken, File, Person, FaceInstance, Label, FileLabel) | Alembic metadata, repositories |
 | `alembic/env.py` | Async migration runner (asyncpg via run_sync) | `python -m alembic ...` |
 | `alembic/versions/20261112_bbecbe6aa8ec_*.py` | Initial schema (tables, vector extension, HNSW index, enums) | migration history |
 | `app/main.py` | `create_app()` factory + module `app`; lifespan (redis pool, engine dispose), middleware order, router registration, `/metrics` route | uvicorn, tests |
-| `tests/conftest.py` | env bootstrapping before app import, `client` fixture (lifespan-aware) | all tests |
-| `tests/test_smoke.py` | P0 endpoint contract tests | pytest |
+| `tests/conftest.py` | env bootstrapping before app import, `client` fixture (lifespan-aware), real compose Redis + per-run rate-limit namespace | all tests |
+| `tests/test_smoke.py` | P0 endpoint contract tests (incl. dead-redis readiness) | pytest |
 | `tests/test_db_integration.py` | pgvector roundtrip + cosine NN + enum persistence (rollback-isolated) | pytest |
+| `tests/test_auth.py` | 17 auth integration tests (register/login/refresh/logout/429) | pytest |
 | `Dockerfile` | multi-stage build: `builder` → `api` / `worker` targets | compose, CI |
 | `docker-compose.yml` | postgres(pgvector), redis, seaweedfs(S3), api | local dev |
 | `deploy/seaweedfs/s3.json` | SeaweedFS S3 credentials (dev creds `minioadmin`) | s3 container |
@@ -110,7 +119,7 @@ every route is a coroutine. No thread pools are used in the API process at P0.
    `{"error":{"code":"internal_error","message":"Internal server error."}}` —
    internals never leak to clients.
 
-## Workflow 4 — Data model (Phase 1)
+## Workflow 5 — Data model (Phase 1)
 
 **Entity relationships** (all FKs declare explicit ON DELETE):
 
@@ -171,7 +180,64 @@ exposed by pgvector as `FaceInstance.embedding.cosine_distance(vec)`;
 HNSW gives approximate-NN with `vector_cosine_ops` — recall trade-off tuned
 via `hnsw.ef_search` at query time (default 40).
 
-## Workflow 5 — Test run (`uv run pytest`)
+## Workflow 6 — Auth (Phase 2)
+
+**Click → code path** (register):
+1. `POST /auth/register` → `app/api/routers/auth.py:register` — schema
+   `RegisterIn` validates email format (EmailStr via email-validator, DNS
+   sanity off) + password length (SecretStr, 8–128).
+2. Rate-limit dependency `rate_limit("auth:register", 5/min)` fires FIRST
+   (`app/services/rate_limit.py`): Redis `INCR rl:{ns}:auth:register:{ip}`,
+   `EXPIRE 60` on first hit; count > limit → `RateLimitedError` 429 with
+   `Retry-After` = TTL. Redis down → fail-open (log + allow).
+3. `AuthService.register` (`app/services/auth.py`): email lowercased →
+   `UserRepository.get_by_email` (dup → 409 `email_taken`) → argon2id hash
+   (`app/services/security.py`, PasswordHasher defaults: 64 MiB, t=3, p=4)
+   → insert → commit. Concurrent-register race loses to the unique index →
+   IntegrityError caught → same 409.
+4. Response: `UserOut` (id, email, created_at). password NEVER returns.
+
+**Login flow**: same rate limit (10/min) → lookup; user missing →
+`dummy_verify()` burns argon2 cost so timing matches a real verify, then 401
+`invalid_credentials` (identical message for wrong password — enumeration
+cannot distinguish). Success → opaque 256-bit refresh token
+(`secrets.token_urlsafe(32)`), only SHA-256 stored; HS256 access JWT
+(sub=user uuid, iat, exp=+15min, typ=access) → `TokenPair`.
+
+**Refresh rotation + reuse detection** (the security core):
+```
+client ──refresh(A)──▶ lookup sha256(A)
+                       ├─ missing ──────────────▶ 401
+                       ├─ revoked_at IS NOT NULL ─▶ REUSE! UPDATE all live
+                       │                            tokens of user → revoked;
+                       │                            log warning; 401
+                       ├─ expired ─▶ revoke; 401
+                       └─ live ─▶ issue NEW token B, revoke A with
+                                  replaced_by_id=B.id (audit chain), commit,
+                                  return pair(B)
+```
+Each token is single-use; a replayed one is evidence of theft → the whole
+family dies and every device must re-login. Verified live in P2 pass 2.
+
+**Logout**: presents refresh token → lookup → unknown/revoked → 401 (no
+silent success oracle) → live → revoke, commit, 204. Access token keeps
+working ≤15 min (stateless JWT trade-off; no blacklist — short expiry is
+the bound).
+
+**`/auth/me`** → `get_current_user` (`app/api/deps.py`): `HTTPBearer`
+(auto_error=False so a missing header raises OUR envelope, not FastAPI's
+403) → `decode_access_token` (PyJWT, typ must be "access") → `session.get`
+User → missing user → 401 (never 404: no account probing).
+
+**Request flow layering** (enforced from P2):
+`router (HTTP shapes) → service (business rules, owns commit) → repository
+(owns all SQL) → model`. A router never touches a session; a repository
+never commits; a service never builds SQL.
+
+**Technologies**: argon2-cffi (argon2id), PyJWT (HS256), redis-py asyncio
+(INCR/EXPIRE/TTL), email-validator, pydantic SecretStr.
+
+## Workflow 7 — Test run (`uv run pytest`)
 
 1. `tests/conftest.py` executes FIRST: sets `ENV=test`, `SECRET_KEY`,
    `DATABASE_URL`, `REDIS_URL` (closed port 127.0.0.1:1) via
@@ -188,7 +254,7 @@ via `hnsw.ef_search` at query time (default 40).
    names redis as `down` (redis client exists but ping fails), and
    client-supplied request-id is echoed.
 
-## Workflow 6 — Docker image build (Dockerfile)
+## Workflow 8 — Docker image build (Dockerfile)
 
 1. `base` (`python:3.12-slim`): sets `PYTHONDONTWRITEBYTECODE`,
    `PYTHONUNBUFFERED`, `WORKDIR /app`.
@@ -202,7 +268,7 @@ via `hnsw.ef_search` at query time (default 40).
    `worker` target: same layers, CMD `arq app.workers.settings.WorkerSettings`
    (inert until Phase 4 adds `app/workers`).
 
-## Workflow 7 — `docker compose up` (local stack)
+## Workflow 9 — `docker compose up` (local stack)
 
 | Service | Image | Port | Notes |
 |---|---|---|---|
@@ -218,7 +284,7 @@ via `hnsw.ef_search` at query time (default 40).
 SeaweedFS is the user-approved local S3 backend; production uses S3/R2 via
 aioboto3 — identical code path (S3 API), only the dev container differs.
 
-## Technologies in play (through Phase 1)
+## Technologies in play (through Phase 2)
 
 - **FastAPI** (ASGI) + **uvicorn** — HTTP layer, fully async handlers.
 - **pydantic-settings v2** — `Settings`; env vars > `.env` > code defaults;
@@ -234,6 +300,9 @@ aioboto3 — identical code path (S3 API), only the dev container differs.
 - **pgvector 0.8.7** — `Vector(512)` columns, cosine-distance operator,
   HNSW ANN index.
 - **Alembic (async env.py)** — versioned schema; transactional DDL.
+- **argon2-cffi** — argon2id password hashing (memory-hard, GPU-unfriendly).
+- **PyJWT** — HS256 access tokens (sub/iat/exp/typ claims).
+- **email-validator** — pydantic `EmailStr` syntax checking.
 - **httpx + pytest-asyncio** — in-process ASGI integration tests.
 - **uv** — locked, cached dependency installs (host + Docker builder).
 - **Docker Compose** — 4-service local stack with health-gated startup.

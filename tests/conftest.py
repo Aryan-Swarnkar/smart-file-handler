@@ -17,7 +17,13 @@ os.environ.setdefault(
     "DATABASE_URL",
     "postgresql+asyncpg://postgres:postgres@localhost:5433/smart_file_handler",
 )
-os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")  # closed port: down
+# P2: auth tests need a REAL redis (rate limiting) — compose redis on 6379.
+# A unique namespace per run keeps rate-limit counters from leaking between
+# pytest runs (Redis data outlives the test process).
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault(
+    "RATELIMIT_NAMESPACE", f"rl-test-{os.urandom(4).hex()}"
+)
 os.environ.setdefault("LOG_FORMAT", "json")
 
 from collections.abc import AsyncGenerator, Generator

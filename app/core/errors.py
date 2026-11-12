@@ -35,11 +35,14 @@ class AppError(Exception):
         code: str | None = None,
         status_code: int | None = None,
         details: Any = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.message = message or self.message
         self.code = code or self.code
         self.status_code = status_code or self.status_code
         self.details = details
+        # e.g. RateLimitedError adds {"Retry-After": "..."}.
+        self.headers = headers
         super().__init__(self.message)
 
 
@@ -105,6 +108,7 @@ def install_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content=_envelope(exc.code, exc.message, exc.details),
+            headers=exc.headers,
         )
 
     @app.exception_handler(StarletteHTTPException)

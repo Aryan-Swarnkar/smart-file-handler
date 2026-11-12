@@ -14,6 +14,9 @@ from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import text
+
+from app.db.session import session_factory
 
 router = APIRouter(tags=["health"])
 
@@ -40,7 +43,18 @@ async def readyz(request: Request) -> JSONResponse:
             checks["redis"] = "down"
             ok = False
 
-    # DB/storage checks append here in P1/P3.
+    try:
+        async with session_factory() as session:
+            await session.execute(text("SELECT 1"))
+        checks["db"] = "up"
+    except OSError:
+        checks["db"] = "down"
+        ok = False
+    except Exception:
+        checks["db"] = "down"
+        ok = False
+
+    # Storage check appends here in P3.
     body: dict[str, Any] = {"status": "ready" if ok else "unavailable", "checks": checks}
     return JSONResponse(
         status_code=status.HTTP_200_OK if ok else status.HTTP_503_SERVICE_UNAVAILABLE,

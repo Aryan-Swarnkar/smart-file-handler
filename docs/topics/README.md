@@ -8,10 +8,10 @@ the topic; a ✅ in the table means the file exists and links code.
 |---|---|---|---|
 | A | Python async foundations | `A-async-foundations.md` | ✅ P0 |
 | B | HTTP / REST / FastAPI | `B-http-rest-fastapi.md` | pending |
-| C | PostgreSQL relational modeling | `C-postgresql.md` | pending |
-| D | Vector search (pgvector) | `D-vector-search.md` | pending |
-| E | SQLAlchemy 2.0 async | `E-sqlalchemy-async.md` | pending |
-| F | Alembic | `F-alembic.md` | pending |
+| C | PostgreSQL relational modeling | `C-postgresql.md` | ✅ P1 |
+| D | Vector search (pgvector) | `D-vector-search.md` | ✅ P1 |
+| E | SQLAlchemy 2.0 async | `E-sqlalchemy-async.md` | ✅ P1 |
+| F | Alembic | `F-alembic.md` | ✅ P1 |
 | G | Auth & security | `G-auth-security.md` | pending |
 | H | Object storage (S3) | `H-object-storage.md` | pending |
 | I | Redis & job queues | `I-redis-job-queues.md` | pending |

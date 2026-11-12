@@ -10,28 +10,34 @@ Reading order convention:
 
 ---
 
-## System map (current: after Phase 0)
+## System map (current: after Phase 1)
 
 ```
 Browser/curl ──HTTP──▶ API (uvicorn, FastAPI) ──▶ structlog JSON logs
                         │            │
                         │            ├─▶ Redis (readiness ping)
-                        │            └─▶ PostgreSQL 16+pgvector (unused yet, P1)
+                        │            ├─▶ PostgreSQL 16+pgvector (SELECT 1 + future ORM)
                         │            └─▶ SeaweedFS S3 API (unused yet, P3)
                         └─▶ /metrics (prometheus-client)
 ```
 
-## File responsibility map (current: after Phase 0)
+## File responsibility map (current: after Phase 1)
 
 | File | Owns | Used by |
 |---|---|---|
 | `app/core/config.py` | `Settings` class + `get_settings()`; all env parsing; production secret validation | everything (never imports other app modules) |
 | `app/core/logging.py` | `configure_logging()` (structlog JSON/console), `RequestIdMiddleware` (pure ASGI), `get_logger()`, `request_id_var` contextvar | main, errors |
 | `app/core/errors.py` | Domain exception classes + `install_error_handlers()` → one JSON envelope | main (wires once) |
-| `app/api/routers/health.py` | `/healthz`, `/readyz`, `/` index routes | main |
-| `app/main.py` | `create_app()` factory + module `app`; lifespan (redis pool), middleware order, router registration, `/metrics` route (explicit, no redirect) | uvicorn, tests |
+| `app/api/routers/health.py` | `/healthz`, `/readyz` (redis + db), `/` index routes | main |
+| `app/db/base.py` | `Base(DeclarativeBase)` + constraint naming convention + `CreatedAtMixin` | all models |
+| `app/db/session.py` | `engine` (create_async_engine), `session_factory`, `get_session` dependency | health now; every router P2+ |
+| `app/db/models/*.py` | 7 ORM models (User, RefreshToken, File, Person, FaceInstance, Label, FileLabel) | Alembic metadata, P2+ repositories |
+| `alembic/env.py` | Async migration runner (asyncpg via run_sync) | `python -m alembic ...` |
+| `alembic/versions/20261112_bbecbe6aa8ec_*.py` | Initial schema (tables, vector extension, HNSW index, enums) | migration history |
+| `app/main.py` | `create_app()` factory + module `app`; lifespan (redis pool, engine dispose), middleware order, router registration, `/metrics` route | uvicorn, tests |
 | `tests/conftest.py` | env bootstrapping before app import, `client` fixture (lifespan-aware) | all tests |
 | `tests/test_smoke.py` | P0 endpoint contract tests | pytest |
+| `tests/test_db_integration.py` | pgvector roundtrip + cosine NN + enum persistence (rollback-isolated) | pytest |
 | `Dockerfile` | multi-stage build: `builder` → `api` / `worker` targets | compose, CI |
 | `docker-compose.yml` | postgres(pgvector), redis, seaweedfs(S3), api | local dev |
 | `deploy/seaweedfs/s3.json` | SeaweedFS S3 credentials (dev creds `minioadmin`) | s3 container |
@@ -92,7 +98,7 @@ every route is a coroutine. No thread pools are used in the API process at P0.
    - on `RedisError`/`OSError` → check marked `down`
 3. All up → `200 {"status":"ready","checks":{"redis":"up"}}`;
    any down → `503 {"status":"unavailable","checks":{...}}`.
-4. Scope: redis only at P0. PostgreSQL check lands P1, storage check P3.
+4. Scope: redis + postgres (P1). Storage (SeaweedFS) check lands in P3.
 
 ## Workflow 4 — Any error response (envelope)
 
@@ -103,6 +109,67 @@ every route is a coroutine. No thread pools are used in the API process at P0.
    `logger.exception()` (structlog) but returns generic
    `{"error":{"code":"internal_error","message":"Internal server error."}}` —
    internals never leak to clients.
+
+## Workflow 4 — Data model (Phase 1)
+
+**Entity relationships** (all FKs declare explicit ON DELETE):
+
+```
+users 1─┬─* refresh_tokens          (CASCADE; replaced_by self-FK SET NULL)
+        ├─* files                   (CASCADE)
+        ├─* persons                 (CASCADE)
+        ├─* labels                  (CASCADE)
+        │      files *─* labels  via file_labels (CASCADE both sides)
+        └─(files) *───* face_instances          (file_id CASCADE, user_id CASCADE)
+persons 1──* face_instances          (person_id SET NULL: deleting a person
+                                      unassigns faces, never deletes them)
+```
+
+**Table-by-table** (`app/db/models/`):
+
+- `users`: uuid PK (client-side `uuid.uuid4`), lowercased-unique email,
+  argon2 hash (stored P2), `created_at` (DB `now()`).
+- `refresh_tokens`: token_hash (SHA-256, unique), expires_at, revoked_at,
+  replaced_by_id → rotation chain for reuse detection.
+- `files`: status enum `file_status(uploaded,processing,done,failed)`, kind
+  enum `file_kind(image,pdf,document,text,other)`, sha256 + storage_key,
+  BigInteger size (int4 overflows at 2GiB), doc_topic denormalized for cheap
+  filters, error text for failures. Indexes: unique `(user_id, sha256)` dedup
+  + `ix_files_user_created_id(user_id, created_at, id)` for keyset pagination.
+- `persons`: centroid `vector(512)` NOT NULL, face_count, cover_face_id
+  (plain uuid — deliberate non-FK, avoids cycle with face_instances; delete
+  flows recompute it).
+- `face_instances`: embedding `vector(512)`, bbox `double precision[]`
+  (x1,y1,x2,y2), det_score. Indexes: HNSW
+  `ix_face_instances_embedding_hnsw` (`vector_cosine_ops`) for ANN search +
+  `ix_face_instances_user_person(user_id, person_id)` for ownership-scoped
+  assignment queries.
+- `labels`: unique `(user_id, name, kind)` — "work" can exist as thing AND
+  doc_topic for the same user; kind enum `label_kind(thing, doc_topic)`.
+- `file_labels`: PK `(file_id, label_id)` + `ix_file_labels_label_id` for the
+  "files by label" reverse scan.
+
+**Session lifecycle** (`app/db/session.py`): `create_async_engine(asyncpg,
+pool_size=10, pool_pre_ping, pool_recycle=1800)` → `async_sessionmaker(
+expire_on_commit=False, autoflush=False)`. One session per request:
+`get_session()` yields inside `async with` (guaranteed close). Idle-in-
+transaction prevention comes from the `async with` block scoping.
+
+**Migration workflow** (run via `.venv\Scripts\python.exe -m alembic ...` —
+the `alembic.exe` shim is broken on this host):
+
+1. `alembic revision --autogenerate -m "..."` diffs `Base.metadata` (all
+   models registered by importing `app.db.models`) against the live DB.
+2. Hand-fix blind spots (extensions, enum type drops, constraint naming).
+3. `alembic upgrade head` applies inside one transaction (Postgres
+   transactional DDL — partial failure rolls back completely).
+4. `alembic downgrade base` must return the DB to truly clean: tables →
+   explicit `DROP TYPE` for the 3 native enums.
+
+**Vector math** (used P5, schema ready now): cosine distance operator `<=>`
+exposed by pgvector as `FaceInstance.embedding.cosine_distance(vec)`;
+HNSW gives approximate-NN with `vector_cosine_ops` — recall trade-off tuned
+via `hnsw.ef_search` at query time (default 40).
 
 ## Workflow 5 — Test run (`uv run pytest`)
 
@@ -151,7 +218,7 @@ every route is a coroutine. No thread pools are used in the API process at P0.
 SeaweedFS is the user-approved local S3 backend; production uses S3/R2 via
 aioboto3 — identical code path (S3 API), only the dev container differs.
 
-## Technologies in play at P0
+## Technologies in play (through Phase 1)
 
 - **FastAPI** (ASGI) + **uvicorn** — HTTP layer, fully async handlers.
 - **pydantic-settings v2** — `Settings`; env vars > `.env` > code defaults;
@@ -161,6 +228,12 @@ aioboto3 — identical code path (S3 API), only the dev container differs.
 - **prometheus-client** — `/metrics` (default process metrics at P0).
 - **redis-py asyncio** — readiness ping (pool reused for rate limiting P2,
   ARQ broker P4).
+- **SQLAlchemy 2.0 async** — `create_async_engine(asyncpg)`,
+  `async_sessionmaker(expire_on_commit=False)`, `Mapped/mapped_column`
+  declarative models, one session per request via dependency.
+- **pgvector 0.8.7** — `Vector(512)` columns, cosine-distance operator,
+  HNSW ANN index.
+- **Alembic (async env.py)** — versioned schema; transactional DDL.
 - **httpx + pytest-asyncio** — in-process ASGI integration tests.
 - **uv** — locked, cached dependency installs (host + Docker builder).
 - **Docker Compose** — 4-service local stack with health-gated startup.

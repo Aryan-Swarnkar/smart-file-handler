@@ -18,6 +18,7 @@ from app.api.routers import health
 from app.core.config import Settings, get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import RequestIdMiddleware, configure_logging, get_logger
+from app.db.session import engine
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             await app.state.redis.aclose()
+            await engine.dispose()
             logger.info("shutdown_complete")
 
     app = FastAPI(

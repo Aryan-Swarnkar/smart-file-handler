@@ -15,7 +15,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault(
     "DATABASE_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/smart_file_handler",
+    "postgresql+asyncpg://postgres:postgres@localhost:5433/smart_file_handler",
 )
 os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:1/0")  # closed port: down
 os.environ.setdefault("LOG_FORMAT", "json")

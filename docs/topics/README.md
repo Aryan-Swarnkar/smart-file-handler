@@ -13,11 +13,11 @@ the topic; a ✅ in the table means the file exists and links code.
 | E | SQLAlchemy 2.0 async | `E-sqlalchemy-async.md` | ✅ P1 |
 | F | Alembic | `F-alembic.md` | ✅ P1 |
 | G | Auth & security | `G-auth-security.md` | ✅ P2 |
-| H | Object storage (S3) | `H-object-storage.md` | pending |
+| H | Object storage (S3) | `H-object-storage.md` | ✅ P3 |
 | I | Redis & job queues | `I-redis-job-queues.md` | pending |
 | J | ML pipeline | `J-ml-pipeline.md` | pending |
 | K | Scalability & system design | `K-scalability.md` | pending |
 | L | Testing | `L-testing.md` | pending |
 | M | Observability & ops | `M-observability.md` | pending |
 | N | Deployment | `N-deployment.md` | pending |
-| O | Privacy & data lifecycle | `O-privacy.md` | pending |
+| O | Privacy & data lifecycle | `O-privacy.md` | ◐ P3 slice (ownership 404, hard delete) |

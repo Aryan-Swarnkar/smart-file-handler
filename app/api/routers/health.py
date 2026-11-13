@@ -3,7 +3,7 @@
 Liveness (`/healthz`) must never touch dependencies: if the process is up, it
 answers — otherwise the orchestrator would restart-loop a DB outage.
 Readiness (`/readyz`) checks each dependency and names the failing one.
-Scope note: redis only at P0; DB joins in P1, storage in P3.
+Scope note: redis + postgres (P0/P1); storage (S3) joined in P3.
 """
 
 from __future__ import annotations
@@ -53,6 +53,18 @@ async def readyz(request: Request) -> JSONResponse:
     except Exception:
         checks["db"] = "down"
         ok = False
+
+    storage = getattr(request.app.state, "storage", None)
+    if storage is None:
+        checks["s3"] = "not_configured"
+        ok = False
+    else:
+        try:
+            await storage.ping()
+            checks["s3"] = "up"
+        except Exception:
+            checks["s3"] = "down"
+            ok = False
 
     # Storage check appends here in P3.
     body: dict[str, Any] = {"status": "ready" if ok else "unavailable", "checks": checks}

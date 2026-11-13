@@ -14,7 +14,6 @@ from collections.abc import AsyncGenerator
 import pytest
 from argon2 import PasswordHasher
 from httpx import AsyncClient, Response
-from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -24,23 +23,6 @@ from app.db.models import RefreshToken, User
 from app.services.security import decode_access_token, hash_refresh_token
 
 _ph = PasswordHasher()
-
-
-@pytest.fixture(autouse=True)
-async def _flush_rate_limits() -> AsyncGenerator[None, None]:
-    """Clear this run's auth rate-limit keys before each test.
-
-    All auth tests come from client IP 127.0.0.1 — without this, an early
-    test hammering login would 429 the rest of the suite.
-    """
-    namespace = get_settings().RATELIMIT_NAMESPACE
-    redis = Redis.from_url(get_settings().REDIS_URL, decode_responses=True)
-    try:
-        async for key in redis.scan_iter(f"{namespace}:auth:*"):
-            await redis.delete(key)
-        yield
-    finally:
-        await redis.aclose()
 
 
 def _email() -> str:

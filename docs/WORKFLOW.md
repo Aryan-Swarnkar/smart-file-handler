@@ -10,43 +10,54 @@ Reading order convention:
 
 ---
 
-## System map (current: after Phase 2)
+## System map (current: after Phase 3)
 
 ```
 Browser/curl ──HTTP──▶ API (uvicorn, FastAPI) ──▶ structlog JSON logs
                         │            │
                         │            ├─▶ Redis (readiness ping, auth rate limits)
-                        │            ├─▶ PostgreSQL 16+pgvector (SELECT 1 + auth ORM)
-                        │            └─▶ SeaweedFS S3 API (unused yet, P3)
-                        └─▶ /metrics (prometheus-client)
+                        │            ├─▶ PostgreSQL 16+pgvector (SELECT 1 + auth/files ORM)
+                        │            ├─▶ SeaweedFS S3 API (presigned PUT/GET, head, delete)
+                        │            │      ▲ bytes go client→S3 DIRECTLY (presigned URLs)
+                        │            └─▶ /metrics (prometheus-client)
+                        └─▶ /metrics
 ```
 
-## File responsibility map (current: after Phase 2)
+## File responsibility map (current: after Phase 3)
 
 | File | Owns | Used by |
 |---|---|---|
 | `app/core/config.py` | `Settings` class + `get_settings()`; all env parsing; production secret validation | everything (never imports other app modules) |
 | `app/core/logging.py` | `configure_logging()` (structlog JSON/console), `RequestIdMiddleware` (pure ASGI), `get_logger()`, `request_id_var` contextvar | main, errors |
 | `app/core/errors.py` | Domain exception classes (+`headers`, e.g. Retry-After) + `install_error_handlers()` → one JSON envelope | main (wires once) |
-| `app/api/routers/health.py` | `/healthz`, `/readyz` (redis + db), `/` index routes | main |
+| `app/api/routers/health.py` | `/healthz`, `/readyz` (redis + db + **s3 HeadBucket**), `/` index routes | main |
 | `app/api/routers/auth.py` | `/auth/register|login|refresh|logout|me` — HTTP shapes only, delegates to AuthService | main |
-| `app/api/deps.py` | `get_current_user` (Bearer→JWT→User), `rate_limit()` factory, `auth_service` provider, `get_redis` | auth router (all protected routers P3+) |
+| `app/api/routers/files.py` | `/files` CRUD: init 201 / complete / list+filters / get / url / PATCH rename / DELETE 204 — HTTP shapes only | main |
+| `app/api/deps.py` | `get_current_user`, `rate_limit()` factory, `auth_service`, **`get_storage` + `files_service`** providers | auth + files routers |
 | `app/schemas/auth.py` | Request/response models (SecretStr, EmailStr, TokenPair) | auth router |
+| `app/schemas/files.py` | `FileInitIn/Out`, `FileOut`, `FileCompleteOut(+deduplicated)`, `FileRenameIn`, `FileUrlOut`, `FilePageOut` | files router |
 | `app/repositories/users.py` | All `users` table queries | AuthService |
 | `app/repositories/refresh_tokens.py` | Token lookup by hash, create, revoke, family nuke | AuthService |
+| `app/repositories/files.py` | All `files` queries + **keyset cursor encode/decode** + `Page` | FileService |
 | `app/services/security.py` | argon2 hash/verify + dummy-verify, JWT create/decode, refresh token material (SHA-256 only stored) | AuthService, deps |
 | `app/services/auth.py` | register/login/refresh(rotation+reuse)/logout business rules; one commit per operation | deps |
+| `app/services/files.py` | **init/complete/list/get/url/rename/delete business rules**: size limit, HEAD→sniff→sha256→dedup→commit, S3-before-DB delete ordering | deps |
+| `app/services/sniffing.py` | **Pure byte classifier**: magic JPEG/PNG/WEBP/PDF/ZIP, office-ext disambiguation, UTF-8 text probe; filename sanitizers | FileService |
+| `app/services/storage.py` | **The only S3 client**: aioboto3 SigV4, presign put/get (public endpoint), head/read/delete, bucket + CORS bootstrap | FileService, readyz |
 | `app/services/rate_limit.py` | Redis fixed-window limiter (INCR+EXPIRE), fail-open policy | deps |
 | `app/db/base.py` | `Base(DeclarativeBase)` + constraint naming convention + `CreatedAtMixin` | all models |
 | `app/db/session.py` | `engine` (create_async_engine), `session_factory`, `get_session` dependency | every router |
-| `app/db/models/*.py` | 7 ORM models (User, RefreshToken, File, Person, FaceInstance, Label, FileLabel) | Alembic metadata, repositories |
+| `app/db/models/*.py` | 7 ORM models (User, RefreshToken, **File (nullable sha256 + uq dedup)**, Person, FaceInstance, Label, FileLabel) | Alembic metadata, repositories |
 | `alembic/env.py` | Async migration runner (asyncpg via run_sync) | `python -m alembic ...` |
 | `alembic/versions/20261112_bbecbe6aa8ec_*.py` | Initial schema (tables, vector extension, HNSW index, enums) | migration history |
-| `app/main.py` | `create_app()` factory + module `app`; lifespan (redis pool, engine dispose), middleware order, router registration, `/metrics` route | uvicorn, tests |
-| `tests/conftest.py` | env bootstrapping before app import, `client` fixture (lifespan-aware), real compose Redis + per-run rate-limit namespace | all tests |
+| `alembic/versions/20261113_a3f1c2d4e5f6_*.py` | P3: `files.sha256` nullable + `uq_files_user_id_sha256` (NULLS DISTINCT) | migration history |
+| `app/main.py` | `create_app()` factory + module `app`; lifespan (redis pool, **StorageService start/close**), middleware order, router registration, `/metrics` route | uvicorn, tests |
+| `tests/conftest.py` | env bootstrapping before app import, `client` fixture (lifespan-aware), real compose Redis + per-run rate-limit namespace, **autouse rate-limit flush per test** | all tests |
 | `tests/test_smoke.py` | P0 endpoint contract tests (incl. dead-redis readiness) | pytest |
 | `tests/test_db_integration.py` | pgvector roundtrip + cosine NN + enum persistence (rollback-isolated) | pytest |
 | `tests/test_auth.py` | 18 auth integration tests (register/login/refresh/logout/429) | pytest |
+| `tests/test_files.py` | 19 files integration tests (real SeaweedFS PUT/GET: kinds, sniff-wins, dedup, 409/422, pagination, 404 matrix, rename/delete, **presign public endpoint**) | pytest |
+| `scripts/p3_live_check.ps1` | 29-check live walkthrough of every files route + readyz + CORS preflight | manual verification |
 | `Dockerfile` | multi-stage build: `builder` → `api` / `worker` targets | compose, CI |
 | `docker-compose.yml` | postgres(pgvector), redis, seaweedfs(S3), api | local dev |
 | `deploy/seaweedfs/s3.json` | SeaweedFS S3 credentials (dev creds `minioadmin`) | s3 container |
@@ -104,10 +115,14 @@ every route is a coroutine. No thread pools are used in the API process at P0.
 2. `readyz()` (`app/api/routers/health.py`):
    - fetches `request.app.state.redis`
    - `await redis.ping()` (async Redis protocol RESP PING)
-   - on `RedisError`/`OSError` → check marked `down`
-3. All up → `200 {"status":"ready","checks":{"redis":"up"}}`;
+   - db: `SELECT 1` through a fresh `session_factory()` session
+   - s3: `await storage.ping()` — HeadBucket via the lifespan-started
+     `StorageService` on `app.state.storage` ("not_configured" if the
+     lifespan never ran); on any exception → check marked `down`
+3. All up → `200 {"status":"ready","checks":{"redis":"up","db":"up","s3":"up"}}`;
    any down → `503 {"status":"unavailable","checks":{...}}`.
-4. Scope: redis + postgres (P1). Storage (SeaweedFS) check lands in P3.
+4. Scope: redis (P0) + postgres (P1) + **s3 (P3, `storage.ping()` = HeadBucket
+   via the api's own S3 client — proves endpoint, creds, and bucket)**.
 
 ## Workflow 4 — Any error response (envelope)
 
@@ -252,24 +267,136 @@ never commits; a service never builds SQL.
 **Technologies**: argon2-cffi (argon2id), PyJWT (HS256), redis-py asyncio
 (INCR/EXPIRE/TTL), email-validator, pydantic SecretStr.
 
-## Workflow 7 — Test run (`uv run pytest`)
+## Workflow 7 — File upload (Phase 3)
+
+**Click → code path** (the presigned dance — bytes NEVER pass through the API):
+
+```
+client                        API                           SeaweedFS
+  │ POST /files/init            │                               │
+  │────────────────────────────▶ row created (sha256=NULL)      │
+  │◀─── 201 {file_id, upload_url, expires_in} ──────────────────│
+  │ PUT upload_url (raw bytes) ─────────────────────────────────▶ object stored
+  │ POST /files/{id}/complete    │                               │
+  │────────────────────────────▶ HEAD ──────────────────────────▶│
+  │                              │ stream 1MiB chunks: sha256 +  │
+  │                              │ sniff head 8KiB               │
+  │                              │ dedup lookup (user_id,sha256) │
+  │◀─── 200 FileCompleteOut ─────┤ (409/422 on failures)         │
+```
+
+1. **`POST /files/init`** (`app/api/routers/files.py:init_upload` →
+   `FileService.init_upload` in `app/services/files.py`):
+   - validate `size ≤ MAX_UPLOAD_MB` (env-driven; over → 422
+     `file_too_large` with `details.max_bytes`);
+   - `sanitize_filename`/`sanitize_extension` (`app/services/sniffing.py`):
+     basename only, 255-char DB cap, lowercase alnum extension ≤10;
+   - storage key `{user_id}/{file_id}.{ext}` (uuid v4; extension from the
+     name — **advisory only**, sniff re-decides at complete);
+   - row created NOW with `sha256=NULL` (NULLs never collide under the
+     `uq_files_user_id_sha256` unique constraint → pending uploads of the
+     same user can't dedupe-collide), `status=uploaded`, `kind=NULL`;
+   - `StorageService.presign_put(key, size)` — SigV4 presigned PUT URL bound
+     to the **public endpoint** (`S3_PUBLIC_ENDPOINT_URL`): signatures embed
+     the host the CLIENT connects to, and containers sign internally with
+     `s3:8333` while clients reach `localhost:9000` — hence the separate
+     presign-only client (`app/services/storage.py`);
+   - commit → `201 {file_id, upload_url, expires_in=PRESIGNED_URL_EXPIRE_SECONDS}`.
+2. **Client `PUT`s the bytes straight to SeaweedFS** with the presigned URL.
+   No auth header — the URL's signature IS the authorization (SigV4, 15-min
+   expiry). Client `Content-Type` is irrelevant (v4 presigned URLs sign only
+   the host header).
+3. **`POST /files/{id}/complete`** → `FileService.complete_upload`:
+   - ownership first: row missing or foreign user → 404 (never 403);
+   - **idempotent**: `sha256` already set → return the same result again
+     (at-least-once client retries are safe);
+   - `storage.head(key)` → object missing → 409 `upload_not_found` (client
+     never PUT or URL expired); `ContentLength != declared size` → 422
+     `size_mismatch` (presigned PUTs don't enforce size — THIS is the real
+     size gate);
+   - `read_head(key, 8192)` (`SNIFF_SAMPLE_BYTES`) → `sniff()` pure
+     classifier (`app/services/sniffing.py`), matrix locked with the user:
+     magic bytes decide; a fake `.jpg` (MZ/exe bytes) → `kind=other` —
+     **sniff wins over the filename**;
+   - `_hash_object` — streaming SHA-256 over 1 MiB chunks (constant memory,
+     25 MB cap keeps this one pass ~cheap);
+   - **dedup**: `get_by_user_and_hash(user_id, sha256)` hit (different row)
+     → delete the just-uploaded S3 object + delete the duplicate row +
+     commit → return the ORIGINAL row with `deduplicated: true`
+     (Google-Photos semantics, user decision #2);
+   - else: persist `sha256/kind/mime_type/size`; `kind=other` →
+     `doc_topic="other"`, `status=done` immediately (nothing for a worker
+     to do); processable kinds stay `status=uploaded` until P4 enqueues.
+4. **`GET /files`** → `FileService.list_files` → `FileRepository.list_page`:
+   - **keyset pagination only** (user-locked: no OFFSET ever). Cursor =
+     base64url of `{created_at.isoformat()}|{id}`; SQL predicate is a
+     PostgreSQL **row-value tuple comparison** `(created_at,id) < (c1,c2)`
+     which walks the composite index `ix_files_user_created_id` (ASC index
+     serves DESC via backward scan) — O(log n) per page at any depth;
+   - `limit` 1–100 (default 20), `+1` fetch probes `has_more` without a
+     second query; tampered cursor → 422 `bad_cursor`;
+   - filters: `kind`, `doc_topic`, `status` (alias param `status` — reserved
+     name); invalid enum → 422 `bad_filter`.
+5. **`GET /files/{id}/url`** → `presign_get(key, download)`; `download=true`
+   adds `ResponseContentDisposition: attachment` (forces save-as). URL is
+   opaque + expiring — no public bucket ACLs, ever.
+6. **`PATCH /files/{id}`** → rename via `sanitize_filename` (display name
+   only — the S3 key never changes).
+7. **`DELETE /files/{id}`** → **hard delete** (user decision #3): S3 object
+   deleted FIRST, then the row. Ordering rationale: S3-delete failure leaves
+   the row intact (client retries; S3 delete is idempotent), while a
+   committed row pointing at an already-deleted object would be a permanent
+   dangling reference. `DELETE /files/{id}` for a foreign id → 404.
+8. **Ownership invariant everywhere** (`FileService.get_file`): any
+   foreign/cross-user id → `NotFoundError` 404 — indistinguishable from a
+   nonexistent id (no probing oracle; user decision pattern carried from P2).
+
+**Startup bootstrap** (`StorageService.start()` from `app/main.py` lifespan):
+build aioboto3 client (`AioConfig(signature_version="s3v4")`) against
+`S3_ENDPOINT_URL`; if `S3_PUBLIC_ENDPOINT_URL` differs, build a second
+presign-only client against it; `ensure_bucket()` = HeadBucket → CreateBucket
+(races between 2 replicas handled) → **`_ensure_cors()`**: PutBucketCors with
+the API's `CORS_ORIGINS` list (SeaweedFS otherwise answers browser OPTIONS
+preflights with 403 AccessDenied; curl never triggers preflight, browsers
+always do — verified live). Shutdown: close both clients.
+
+**Technologies**: aioboto3 (async boto3) + botocore SigV4 presigned URLs,
+SeaweedFS S3 API (dev) / AWS S3 / Cloudflare R2 (prod), hashlib streaming
+SHA-256, PostgreSQL row-value comparison + composite index, base64url opaque
+cursors.
+
+## Workflow 8 — Test run (`uv run pytest`)
 
 1. `tests/conftest.py` executes FIRST: sets `ENV=test`, `SECRET_KEY`,
-   `DATABASE_URL`, `REDIS_URL` (closed port 127.0.0.1:1) via
-   `os.environ.setdefault` **before importing app** (module-level `app =
-   create_app()` reads settings at import time).
+   `DATABASE_URL` (compose postgres on **5433** — host 5432 is occupied),
+   `REDIS_URL` (compose redis — REAL, auth rate limiting needs it), and a
+   unique per-run `RATELIMIT_NAMESPACE` via `os.environ.setdefault` **before
+   importing app** (module-level `app = create_app()` reads settings at
+   import time).
 2. `client` fixture: `create_app()` →
    `async with app.router.lifespan_context(app)` (httpx `ASGITransport` does
    NOT run lifespan, so we run it explicitly — startup/shutdown really
-   execute) → `httpx.AsyncClient(transport=ASGITransport(app), ...)`.
+   execute, including StorageService + bucket/CORS bootstrap) →
+   `httpx.AsyncClient(transport=ASGITransport(app), ...)`.
 3. `_reset_settings_cache` (autouse): clears the `get_settings` lru_cache
    around every test so env changes take effect.
-4. `tests/test_smoke.py`: 6 tests — healthz shape, index links, OpenAPI
+4. `_flush_rate_limits` (autouse, moved to conftest in P3): deletes
+   `{namespace}:auth:*` keys before EVERY test — all API tests share client
+   IP 127.0.0.1, and the files suite registers ~18 users per run, which
+   would otherwise 429 the rest of the suite.
+5. **ASGITransport gotcha (P3)**: the test client routes EVERY request —
+   even absolute URLs — into the ASGI app itself, so an S3 PUT "via" the
+   test client never leaves the process (it returned our own 404 envelope).
+   `tests/test_files.py` therefore does presigned PUTs/GETs with a separate
+   real-network `httpx.AsyncClient()`. Browsers/curl are unaffected.
+6. Files tests need the compose stack UP (postgres 5433 + SeaweedFS 9000):
+   they exercise real S3 objects, real dedup, real pagination.
+7. `tests/test_smoke.py`: 6 tests — healthz shape, index links, OpenAPI
    contains `/healthz`, 404 envelope carries request_id, readyz is 503 and
    names redis as `down` (redis client exists but ping fails), and
    client-supplied request-id is echoed.
 
-## Workflow 8 — Docker image build (Dockerfile)
+## Workflow 9 — Docker image build (Dockerfile)
 
 1. `base` (`python:3.12-slim`): sets `PYTHONDONTWRITEBYTECODE`,
    `PYTHONUNBUFFERED`, `WORKDIR /app`.
@@ -283,14 +410,14 @@ never commits; a service never builds SQL.
    `worker` target: same layers, CMD `arq app.workers.settings.WorkerSettings`
    (inert until Phase 4 adds `app/workers`).
 
-## Workflow 9 — `docker compose up` (local stack)
+## Workflow 10 — `docker compose up` (local stack)
 
 | Service | Image | Port | Notes |
 |---|---|---|---|
 | postgres | `pgvector/pgvector:pg16` | **5433**→5432 | pgvector build of PG16 (needed P1); host 5432 occupied by stale stage-1 container `beta-db-1` |
 | redis | `redis:7-alpine` | 6379 | AOF persistence on |
 | s3 | `chrislusf/seaweedfs:3.99` | 9000→8333, 9333 | S3 API + master UI; creds from `deploy/seaweedfs/s3.json` |
-| api | built (`target: api`) | 8000 | env overrides `.env` (env vars beat dotenv in pydantic-settings) |
+| api | built (`target: api`) | 8000 | env overrides `.env` (env vars beat dotenv in pydantic-settings); `S3_ENDPOINT_URL=s3:8333` (internal) + `S3_PUBLIC_ENDPOINT_URL=localhost:9000` (handed-out presigned URLs) |
 
 `depends_on` uses `service_healthy` conditions, not just "started".
 
@@ -299,7 +426,7 @@ never commits; a service never builds SQL.
 SeaweedFS is the user-approved local S3 backend; production uses S3/R2 via
 aioboto3 — identical code path (S3 API), only the dev container differs.
 
-## Technologies in play (through Phase 2)
+## Technologies in play (through Phase 3)
 
 - **FastAPI** (ASGI) + **uvicorn** — HTTP layer, fully async handlers.
 - **pydantic-settings v2** — `Settings`; env vars > `.env` > code defaults;
@@ -319,5 +446,9 @@ aioboto3 — identical code path (S3 API), only the dev container differs.
 - **PyJWT** — HS256 access tokens (sub/iat/exp/typ claims).
 - **email-validator** — pydantic `EmailStr` syntax checking.
 - **httpx + pytest-asyncio** — in-process ASGI integration tests.
+- **aioboto3** (async boto3 + aiobotocore) — the only S3 client: SigV4
+  presigned PUT/GET URLs, HeadObject/GetObject streaming, DeleteObject,
+  HeadBucket readiness, PutBucketCors bootstrap. Dual-endpoint design
+  (internal client vs public presigner) keeps container networking honest.
 - **uv** — locked, cached dependency installs (host + Docker builder).
 - **Docker Compose** — 4-service local stack with health-gated startup.

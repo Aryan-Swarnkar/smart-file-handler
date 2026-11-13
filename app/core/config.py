@@ -69,12 +69,22 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # --- object storage (validated for real use in P3) ------------------------
+    # S3_ENDPOINT_URL: where THIS app talks to S3 (inside the network).
+    # S3_PUBLIC_ENDPOINT_URL: where UPLOAD CLIENTS must reach S3 — presigned
+    # URLs are built from it. Defaults to S3_ENDPOINT_URL when empty. They
+    # differ in containers: api signs with s3:8333 internally but hands out
+    # http://localhost:9000 so a host browser/curl can complete the PUT.
     S3_ENDPOINT_URL: str | None = None
+    S3_PUBLIC_ENDPOINT_URL: str = ""
     S3_REGION: str = "us-east-1"
     S3_BUCKET: str = "smart-file-handler"
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     PRESIGNED_URL_EXPIRE_SECONDS: int = 900
+
+    @property
+    def s3_public_endpoint_url(self) -> str:
+        return self.S3_PUBLIC_ENDPOINT_URL or (self.S3_ENDPOINT_URL or "")
 
     # --- uploads ---------------------------------------------------------------
     MAX_UPLOAD_MB: int = 25

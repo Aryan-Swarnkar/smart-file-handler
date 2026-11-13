@@ -15,8 +15,10 @@ from app.core.errors import RateLimitedError, UnauthorizedError
 from app.db.models import User
 from app.db.session import get_session
 from app.services.auth import AuthService
+from app.services.files import FileService
 from app.services.rate_limit import RateLimiter
 from app.services.security import decode_access_token
+from app.services.storage import StorageService
 
 # auto_error=False: a missing Authorization header should raise OUR envelope
 # (401 unauthorized), not FastAPI's default 403 "Not authenticated".
@@ -92,5 +94,20 @@ def auth_service(session: Annotated[AsyncSession, Depends(get_session)]) -> Auth
     return AuthService(session)
 
 
+def get_storage(request: Request) -> StorageService:
+    storage: StorageService | None = getattr(request.app.state, "storage", None)
+    if storage is None:  # lifespan never ran — fail loudly, not mysteriously
+        raise RuntimeError("Storage not initialized; lifespan did not run.")
+    return storage
+
+
+def files_service(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    storage: Annotated[StorageService, Depends(get_storage)],
+) -> FileService:
+    return FileService(session, storage)
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AuthedService = Annotated[AuthService, Depends(auth_service)]
+FilesService = Annotated[FileService, Depends(files_service)]

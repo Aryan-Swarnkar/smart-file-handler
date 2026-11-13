@@ -30,6 +30,7 @@ from collections.abc import AsyncGenerator, Generator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
 
 from app.core.config import get_settings
 from app.main import create_app
@@ -41,6 +42,25 @@ def _reset_settings_cache() -> Generator[None, None, None]:
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+async def _flush_rate_limits() -> AsyncGenerator[None, None]:
+    """Clear this run's auth rate-limit keys before each test.
+
+    All API tests share client IP 127.0.0.1 — without this, an early test
+    hammering login/registration would 429 the rest of the suite. Kept here
+    (not in test modules) so every API module inherits it; P3's files suite
+    does ~18 registrations per run and needs a clean counter per test.
+    """
+    namespace = get_settings().RATELIMIT_NAMESPACE
+    redis = Redis.from_url(get_settings().REDIS_URL, decode_responses=True)
+    try:
+        async for key in redis.scan_iter(f"{namespace}:auth:*"):
+            await redis.delete(key)
+        yield
+    finally:
+        await redis.aclose()
 
 
 @pytest.fixture

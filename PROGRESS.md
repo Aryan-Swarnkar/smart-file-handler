@@ -16,6 +16,8 @@ Running log of phases, verification evidence, and known gaps. Updated after ever
 | 8 | Build at repo root (`fin-sm-f/`); emails lowercased (no citext); face cosine threshold 0.6 (env-configurable); SSE deferred; storage key `{user_id}/{file_id}{ext}` |
 | 9 | **Local S3 backend = SeaweedFS** (`chrislusf/seaweedfs:3.99`), user-approved after MinIO community edition was discontinued (repo archived, images gone from Docker Hub/quay, dl.min.io binaries 410 Gone — all verified). Production stays S3/R2 via aioboto3. |
 | 10 | **`docs/WORKFLOW.md`** — single living workflow doc (click → function → file → algorithm → technology), updated after every phase. User-requested. |
+| 11 | **P3 upload design (9 decisions via Q&A)**: presigned init/complete (bytes bypass API); duplicate → EXISTING row + `deduplicated: true` + duplicate object deleted; hard delete (row + S3 object); thumbnails deferred to P5; P3 browse = filters only; **sniff wins** (fake .jpg → other); office = ZIP magic + extension; PATCH rename; 20/page max 100, newest-first, opaque base64 cursor. |
+| 12 | **P3 endpoint split**: `S3_PUBLIC_ENDPOINT_URL` for handed-out presigned URLs (host-reachable) vs `S3_ENDPOINT_URL` for container ops; SigV4 only (v2 breaks on client Content-Type); bucket CORS bootstrapped from `CORS_ORIGINS` at startup. |
 
 ## Phases
 
@@ -24,7 +26,7 @@ Running log of phases, verification evidence, and known gaps. Updated after ever
 | P0 | Skeleton: config, logging, errors, app factory, health, compose (pgvector-pg16, redis, SeaweedFS S3, api), Dockerfile | ✅ done (verified 2026-11-12) |
 | P1 | DB + Alembic async: models, initial migration + vector extension | ✅ done (verified 2026-11-12) |
 | P2 | Auth: register/login/refresh rotation/logout, rate limiting | ✅ done (verified 2026-11-12) |
-| P3 | Upload flow: presigned init/complete, dedup, validation, keyset pagination | pending |
+| P3 | Upload flow: presigned init/complete, dedup, validation, keyset pagination | ✅ done (verified 2026-11-13) |
 | P4 | Queue + worker skeleton: ARQ, idempotency, retry/backoff, crash recovery | pending |
 | P5 | Image pipeline: InsightFace faces, pgvector clustering, CLIP labels | pending |
 | P6 | PDF/Office/text pipelines: extraction + topic labels | pending |
@@ -68,14 +70,17 @@ line" rule):
 
 ## Known gaps (carried, resolved in later phases)
 
-- S3 (SeaweedFS) readiness check lands in P3.
+- ~~S3 (SeaweedFS) readiness check lands in P3~~ **done in P3** (readyz s3:up).
+- Orphan init rows (init without complete) linger; cleanup sweeps land in P4.
 - Dockerfile `worker` target exists but inert (no `app.workers` until P4).
 - `/metrics` exposes default process metrics only; RED HTTP metrics land in P8.
 - README still stage-1 placeholder; rewritten in P9 with architecture/scaling docs.
 - ML deps (insightface, open_clip, torch, PyMuPDF, office parsers) added in P5/P6.
-- Integration tests require the compose DB running + migrated (documented).
+- Integration tests require the compose stack running + migrated (documented).
 - Rate limiter trusts `request.client.host` only; X-Forwarded-For handling
   (proxy-aware real IPs) lands in P9 deployment.
+- `files.status` filter matches only exact enum values; combined
+  kind+status+topic queries are ANDed (fine for P3; search arrives later).
 
 ## P1 — DB + Alembic ✅
 
@@ -191,3 +196,90 @@ Verified 2×: pytest 26/26 (idempotent-logout + whitespace + 429-body tests),
 ruff + mypy clean; rebuilt image → live curl: stale-token logout 204
 (the user's exact scenario), live-token 204, repeat-logout 204, garbage 204,
 whitespace-padded refresh 200, 429 body message with correct seconds.
+
+## P3 — Files: presigned upload, dedup, browse ✅
+
+Built (7 routes under `/files`, all Bearer-protected):
+
+- `app/services/storage.py` — the ONLY module touching object storage.
+  aioboto3 + `AioConfig(signature_version="s3v4")` (v4 presigned URLs sign
+  only the host header → client Content-Type can't invalidate them; v2 is
+  deprecated). Dual endpoint: internal client (`S3_ENDPOINT_URL`, container
+  ops: head/read/delete) vs presign-only client (`S3_PUBLIC_ENDPOINT_URL`,
+  URLs handed to clients — host-reachable). `ensure_bucket` = HeadBucket →
+  CreateBucket (2-replica race caught) → PutBucketCors from `CORS_ORIGINS`.
+- `app/services/sniffing.py` — pure byte classifier (no I/O): JPEG/PNG/WEBP/
+  PDF magics; ZIP magic + extension → docx/pptx/xlsx or `other`; text kinds
+  must decode UTF-8 with no NULs; everything else `other` — **sniff wins
+  over the filename** (fake .jpg never enters the face pipeline).
+- `app/services/files.py` — init (size cap, sanitize, key
+  `{user_id}/{file_id}{ext}`, presign_put, row w/ sha256=NULL) / complete
+  (HEAD → size check → sniff → stream SHA-256 → per-user dedup → commit) /
+  list (keyset) / get / url / rename / delete (S3-before-DB ordering).
+- `app/repositories/files.py` — all file SQL + keyset cursor:
+  base64url `{created_at}|{id}`, PG row-value `(created_at,id) < (c1,c2)`
+  on `ix_files_user_created_id`, `limit+1` has_more probe.
+- `app/schemas/files.py`, `app/api/routers/files.py` — shapes only.
+- `app/api/deps.py` — `get_storage` (lifespan app.state) + `files_service`.
+- `app/main.py` — lifespan starts/closes StorageService; files router.
+- `/readyz` — `s3: up/down` via HeadBucket.
+- Migration `20261113_a3f1c2d4e5f6`: `files.sha256` nullable +
+  `uq_files_user_id_sha256` (NULLS DISTINCT → pending uploads don't collide).
+- `tests/test_files.py` — 19 tests vs REAL SeaweedFS: init row+presign,
+  oversize/zero-size 422, kinds jpeg/png/webp/pdf/docx/txt/csv, bat→other,
+  fake-jpg sniff-wins, 409 upload_not_found, idempotent complete, dedup
+  returns existing row (DB count=1), pagination+cursor, filters+bad enum
+  422, bad cursor 422, cross-user 404 matrix, view/download url, rename,
+  delete removes row+object (presigned GET then != 200), auth guard,
+  **presign public-endpoint test**.
+- `scripts/p3_live_check.ps1` — repeatable 29-check live walkthrough.
+
+Decisions locked with the user (plan-mode Q&A): presigned init/complete
+(bytes bypass API); duplicate upload returns EXISTING row + `deduplicated:
+true` + duplicate object deleted; hard delete (row + S3 object); thumbnails
+deferred to P5; browse = filters only (no search yet); sniff wins; office =
+ZIP magic + extension disambiguation; PATCH rename; 20/page (max 100),
+newest-first, opaque cursor.
+
+Verified (2 full passes as required):
+
+- Pass 1: ruff + mypy clean (41 files), pytest **46/46** (8 smoke/db + 18
+  auth + 19 files + 1 presign-endpoint).
+- Pass 2: identical full gate again.
+- Live ×2 (rebuilt image): `scripts/p3_live_check.ps1` **29/29** — readyz
+  s3:up; register/login; init→PUT→complete for all 7 kinds; fake .jpg →
+  other+done; dedup `deduplicated:true` + original id; 409 upload_not_found;
+  422 file_too_large; newest-first list + cursor page 2; kind/doc_topic
+  filters; bad kind 422; cross-user GET/DELETE 404; presigned GET serves
+  exact bytes; download disposition; PATCH rename; DELETE 204 → GET 404 →
+  S3 object gone; **CORS preflight 200 with Access-Control-Allow-Origin**
+  (browser PUT verified end-to-end against SeaweedFS).
+
+Bugs caught by testing this phase:
+
+1. `FileCompleteOut.model_validate(File)` 500'd — ORM has no `deduplicated`
+   attribute. Fixed: build `FileOut` then compose explicitly.
+2. Test-harness illusion: httpx `ASGITransport` routes absolute URLs into
+   the app — "S3 PUT 404" was OUR envelope. Real-network client for S3 ops
+   in tests.
+3. **Presigned URLs used the container-internal endpoint (`s3:8333`)** —
+   unresolvable from host browsers/curl (tests passed only because the app
+   ran in-process with host env). Added `S3_PUBLIC_ENDPOINT_URL` +
+   presign-only client. This was the big one — a production bug class.
+4. SigV2 presigned signatures break when the client sends any Content-Type
+   (v2 signs it; PowerShell/browser always do). Migrated to SigV4
+   (host-only signed) — verified 200 with unrelated Content-Type.
+5. SeaweedFS answered browser CORS preflights with 403 AccessDenied
+   (anonymous OPTIONS hit the IAM layer). Fixed: PutBucketCors at startup
+   from `CORS_ORIGINS` — preflight now 200 with the right headers.
+6. Test pollution ×2: DB rows persist across runs → fixed payload counted
+   previous runs' rows (dedup test now uses unique bytes); rate-limit
+   counters leaked across test modules (flush fixture moved to conftest).
+7. Invalid `?kind=nope` → ValueError 500; now mapped to 422 `bad_filter`.
+8. mypy: aioboto3 needs `AioConfig(**kwargs)`, NOT `AioConfig(botocore.Config)`
+   (lands in connector_args → `.items()` AttributeError at runtime).
+
+Known gaps from P3 (carried): orphan init rows (init-without-complete)
+cleanup lands in P4; complete's single-pass hash+sniff is fine at 25 MB but
+multipart/large-object support would need range reads (P9 decision);
+`status` filter is exact-match only.

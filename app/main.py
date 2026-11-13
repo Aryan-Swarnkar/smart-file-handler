@@ -14,11 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.asyncio import Redis
 
-from app.api.routers import auth, health
+from app.api.routers import auth, files, health
 from app.core.config import Settings, get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import RequestIdMiddleware, configure_logging, get_logger
 from app.db.session import engine
+from app.services.storage import StorageService
 
 logger = get_logger(__name__)
 
@@ -34,11 +35,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = Redis.from_url(
             settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2
         )
+        # Object storage client (S3-compatible: SeaweedFS dev, S3/R2 prod).
+        # The bucket is created idempotently here so replicas never depend on
+        # an init container.
+        storage = StorageService()
+        await storage.start()
+        app.state.storage = storage
         logger.info("startup_complete", env=settings.ENV)
         try:
             yield
         finally:
             await app.state.redis.aclose()
+            await storage.close()
             await engine.dispose()
             logger.info("shutdown_complete")
 
@@ -65,6 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_error_handlers(app)
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(files.router)
 
     # Explicit route instead of mounting make_asgi_app(): a mount 307-redirects
     # /metrics -> /metrics/, which looks broken to curl and simple scrapers.

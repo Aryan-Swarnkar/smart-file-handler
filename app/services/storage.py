@@ -1,0 +1,250 @@
+"""S3 storage via aioboto3 — the ONLY module that touches object storage.
+
+Lifecycle: `start()` builds the client (lifespan startup), `close()` releases
+it. Stateless per-request: presigned URLs are computed locally (no network),
+so N API replicas sign independently — no shared state, horizontal-scale safe.
+
+Local dev: SeaweedFS (S3 API compatible). Production: AWS S3 / Cloudflare R2
+— same code, different S3_ENDPOINT_URL/creds from env.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING, Any
+
+import aioboto3
+from aiobotocore.config import AioConfig
+from botocore.exceptions import BotoCoreError, ClientError
+
+from app.core.config import get_settings
+from app.core.logging import get_logger
+
+if TYPE_CHECKING:
+    # Service-specific stubs (types-aioboto3) give fully-typed S3 methods;
+    # at runtime the client is duck-typed via aiobotocore.
+    from types_aiobotocore_s3 import S3Client
+
+logger = get_logger(__name__)
+
+# 1 MiB read chunks: SHA-256 streaming + memory ceiling independent of the
+# 25 MB object size (and of any future size bump).
+READ_CHUNK_BYTES = 1024 * 1024
+
+
+# SigV4 everywhere: presigned v4 URLs sign only the host header, so client
+# Content-Type (which browsers set freely) can't invalidate the signature.
+# SeaweedFS, real S3, and Cloudflare R2 all support v4; v2 is deprecated.
+# AioConfig subclasses botocore.Config — same kwargs, plus aiohttp connector
+# options. Passing a botocore Config *object* would land in connector_args.
+_S3_CONFIG = AioConfig(signature_version="s3v4")
+
+
+class StorageService:
+    def __init__(self) -> None:
+        self._settings = get_settings()
+        self._session: aioboto3.Session | None = None
+        self._client_ctx: Any = None
+        self._client: S3Client | None = None  # runtime: aiobotocore S3 client
+        # Presign-only client bound to the PUBLIC endpoint: signatures embed
+        # the host the client will connect to, so handed-out URLs must be
+        # signed against what a host browser/curl can actually reach.
+        self._presign_ctx: Any = None
+        self._presign_client: S3Client | None = None
+
+    async def start(self) -> None:
+        s = self._settings
+        self._session = aioboto3.Session(
+            aws_access_key_id=s.S3_ACCESS_KEY_ID,
+            aws_secret_access_key=s.S3_SECRET_ACCESS_KEY,
+            region_name=s.S3_REGION,
+        )
+        self._client_ctx = self._session.client(
+            "s3", endpoint_url=s.S3_ENDPOINT_URL, config=_S3_CONFIG
+        )
+        self._client = await self._client_ctx.__aenter__()
+        public = s.s3_public_endpoint_url
+        if public and public != s.S3_ENDPOINT_URL:
+            self._presign_ctx = self._session.client(
+                "s3", endpoint_url=public, config=_S3_CONFIG
+            )
+            self._presign_client = await self._presign_ctx.__aenter__()
+        await self.ensure_bucket()
+        logger.info(
+            "storage_started",
+            bucket=s.S3_BUCKET,
+            endpoint=s.S3_ENDPOINT_URL,
+            presign_endpoint=public,
+        )
+
+    async def close(self) -> None:
+        if self._presign_ctx is not None:
+            await self._presign_ctx.__aexit__(None, None, None)
+            self._presign_client = None
+            self._presign_ctx = None
+        if self._client_ctx is not None:
+            await self._client_ctx.__aexit__(None, None, None)
+            self._client = None
+            self._client_ctx = None
+
+    def _bucket(self) -> str:
+        return self._settings.S3_BUCKET
+
+    def _require_client(self) -> S3Client:
+        if self._client is None:
+            raise RuntimeError("StorageService.start() has not run.")
+        return self._client
+
+    def _presigner(self) -> S3Client:
+        # Falls back to the internal client when no public endpoint is set.
+        client = self._presign_client or self._client
+        if client is None:
+            raise RuntimeError("StorageService.start() has not run.")
+        return client
+
+    async def ensure_bucket(self) -> None:
+        """CreateBucket at startup. SeaweedFS auto-materializes it lazily, but
+        an explicit PutBucket makes the flow identical on real S3 (where the
+        bucket must exist before the first PutObject)."""
+        client = self._require_client()
+        try:
+            await client.head_bucket(Bucket=self._bucket())
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in ("404", "NoSuchBucket"):
+                raise
+            try:
+                await client.create_bucket(Bucket=self._bucket())
+                logger.info("bucket_created", bucket=self._bucket())
+            except ClientError as exc2:
+                # Parallel startup (2 replicas) racing on the same bucket.
+                if exc2.response.get("Error", {}).get("Code") not in (
+                    "BucketAlreadyOwnedByYou",
+                    "BucketAlreadyExists",
+                ):
+                    raise
+        await self._ensure_cors()
+
+    async def _ensure_cors(self) -> None:
+        """Bucket CORS for direct browser PUTs (presigned upload flow).
+
+        Without it SeaweedFS answers a browser's OPTIONS preflight with 403
+        AccessDenied and the upload dies in the browser even though curl
+        works. Origins come from CORS_ORIGINS — the same list that gates the
+        API's CORS middleware, since a page allowed to call the API is also
+        allowed to complete its uploads. Re-put only on change (idempotent;
+        on real S3 this is normally managed by IaC instead).
+        """
+        origins = [
+            o.strip() for o in self._settings.CORS_ORIGINS.split(",") if o.strip()
+        ]
+        if not origins:
+            return
+        # Any: the aiobotocore stub's CORSRule TypedDict shape, but comparing
+        # against get_bucket_cors output needs plain dict semantics.
+        rules: Any = [
+            {
+                "AllowedOrigins": origins,
+                "AllowedMethods": ["GET", "PUT", "HEAD"],
+                "AllowedHeaders": ["*"],
+                "MaxAgeSeconds": 3000,
+            }
+        ]
+        client = self._require_client()
+        try:
+            current = await client.get_bucket_cors(Bucket=self._bucket())
+            if current.get("CORSRules") == rules:
+                return
+        except ClientError:
+            pass  # NoSuchCORSConfiguration (or new bucket) → set below
+        await client.put_bucket_cors(
+            Bucket=self._bucket(), CORSConfiguration={"CORSRules": rules}
+        )
+        logger.info("bucket_cors_configured", origins=origins)
+
+    async def ping(self) -> None:
+        """Readiness check: HeadBucket. Raises on any failure."""
+        await self._require_client().head_bucket(Bucket=self._bucket())
+
+    async def presign_put(self, key: str, content_length: int) -> tuple[str, int]:
+        """PUT url for the declared size.
+
+        ContentLength rides in the request template, not the URL (SigV4
+        presigned URLs sign only the host) — the DEFINITIVE size check is
+        HEAD-vs-declared at complete_upload (size_mismatch).
+        """
+        client = self._presigner()
+        expires = self._settings.PRESIGNED_URL_EXPIRE_SECONDS
+        url = await client.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": self._bucket(),
+                "Key": key,
+                "ContentLength": content_length,
+            },
+            ExpiresIn=expires,
+        )
+        return url, expires
+
+    async def presign_get(self, key: str, download: bool) -> tuple[str, int]:
+        """GET url. download=True forces a save-as filename from the key."""
+        client = self._presigner()
+        expires = self._settings.PRESIGNED_URL_EXPIRE_SECONDS
+        params: dict[str, Any] = {"Bucket": self._bucket(), "Key": key}
+        if download:
+            filename = key.rsplit("/", 1)[-1]
+            params["ResponseContentDisposition"] = (
+                f'attachment; filename="{filename}"'
+            )
+        url = await client.generate_presigned_url(
+            "get_object", Params=params, ExpiresIn=expires
+        )
+        return url, expires
+
+    async def head(self, key: str) -> dict[str, Any] | None:
+        """Object metadata or None if absent (404 → None, other errors raise)."""
+        client = self._require_client()
+        try:
+            resp = await client.head_object(Bucket=self._bucket(), Key=key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+        return resp
+
+    async def read(self, key: str) -> AsyncGenerator[bytes, None]:
+        """Stream the object body in 1 MiB chunks (hashing/sniffing)."""
+        client = self._require_client()
+        resp = await client.get_object(Bucket=self._bucket(), Key=key)
+        try:
+            async for chunk in resp["Body"]:
+                yield chunk
+        finally:
+            resp["Body"].close()
+
+    async def read_head(self, key: str, n: int) -> tuple[bytes, bool]:
+        """First ≤n bytes + whether the object is bigger (sniffing helper)."""
+        head = b""
+        more = False
+        stream = self.read(key)
+        try:
+            async for chunk in stream:
+                if len(head) + len(chunk) > n:
+                    head = (head + chunk)[:n]
+                    more = True
+                    break
+                head += chunk
+        finally:
+            # Deterministic cleanup: breaking out of `async for` otherwise
+            # leaves the generator (and its HTTP stream) to the GC.
+            await stream.aclose()
+        return head, more
+
+    async def delete(self, key: str) -> None:
+        """Idempotent (S3 delete of a missing key succeeds)."""
+        await self._require_client().delete_object(Bucket=self._bucket(), Key=key)
+
+    # Exceptions surfaced to callers that must map them:
+    ClientError = ClientError
+    BotoCoreError = BotoCoreError

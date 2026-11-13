@@ -38,7 +38,11 @@ async def register(
     service: AuthedService,
     _rl: Annotated[
         None,
-        Depends(rate_limit("auth:register", _settings.REGISTER_RATELIMIT_PER_MINUTE)),
+        Depends(
+            rate_limit(
+                "auth:register", _settings.REGISTER_RATELIMIT_PER_MINUTE, action="registration"
+            )
+        ),
     ],
 ) -> UserOut:
     user = await service.register(payload.email, payload.password.get_secret_value())
@@ -49,7 +53,12 @@ async def register(
 async def login(
     payload: LoginIn,
     service: AuthedService,
-    _rl: Annotated[None, Depends(rate_limit("auth:login", _settings.LOGIN_RATELIMIT_PER_MINUTE))],
+    _rl: Annotated[
+        None,
+        Depends(
+            rate_limit("auth:login", _settings.LOGIN_RATELIMIT_PER_MINUTE, action="login")
+        ),
+    ],
 ) -> TokenPair:
     result = await service.login(payload.email, payload.password.get_secret_value())
     return TokenPair(

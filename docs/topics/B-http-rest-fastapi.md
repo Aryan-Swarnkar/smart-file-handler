@@ -13,7 +13,7 @@ Code: `app/api/routers/{health,auth}.py`, `app/api/deps.py`,
 | POST | /auth/register | 201 UserOut | 409 email_taken, 422 validation, 429 rate_limited |
 | POST | /auth/login | 200 TokenPair | 401 invalid_credentials, 429 |
 | POST | /auth/refresh | 200 TokenPair (new pair) | 401 invalid_refresh_token |
-| POST | /auth/logout | 204 | 401 invalid_refresh_token |
+| POST | /auth/logout | 204 (idempotent — never fails) | 422 malformed body |
 | GET | /auth/me | 200 UserOut | 401 unauthorized |
 
 Conventions: nouns not verbs in paths, plural resources, proper status codes

@@ -132,7 +132,8 @@ Built: the three-layer structure the rest of the app follows.
   login (generic `invalid_credentials` 401 both paths), refresh with
   **rotation** (old → revoked + replaced_by_id chain) and **reuse detection**
   (a revoked token presented again nukes the user's ENTIRE live token family),
-  logout (401 on unknown/already-revoked, no logout oracle).
+  logout — **idempotent since P2.1: always 204** (live → revoked; unknown/
+  revoked → no-op; tokens stripped).
 - `app/services/rate_limit.py` — Redis fixed-window limiter (INCR+EXPIRE),
   shared across replicas, **fail-open** if Redis is down (availability first,
   argon2 cost still throttles), 429 + Retry-After.
@@ -162,7 +163,31 @@ Decisions made this phase (standard, flag if you want changes):
 
 - Password floor 8 chars (pydantic min_length) — argon2 does the real work.
 - Refresh tokens live 7 days (config REFRESH_TOKEN_EXPIRE_DAYS).
-- Logout with unknown/revoked token → 401 (no silent no-op oracle).
+- ~~Logout with unknown/revoked token → 401~~ **changed in P2.1** (below).
 - After logout, the access token still works ≤15 min (stateless JWT; short
   expiry + rotation is the bound — no token blacklist).
 - Rate limiter fail-open on Redis outage.
+
+## P2.1 — Logout fix (user-reported) ✅
+
+Bug: after exercising `refresh` (or hitting reuse detection), `logout` with
+the held token returned 401 `invalid_refresh_token` — the client could not
+log out at all. Root cause: strict-401 design + single-use rotation means
+every token a client still holds is already dead.
+
+Fixes (user confirmed the design via plan-mode Q&A):
+
+1. **Idempotent logout (RFC 7009)**: `POST /auth/logout` always 204 — live
+   token → revoked; unknown/revoked → silent no-op. Kills the token-existence
+   probing oracle too (uniform response).
+2. **`.strip()` on presented tokens** in refresh + logout (copy-paste
+   whitespace used to change the SHA-256 and fail a correct token).
+3. Clearer 401: "Invalid or expired refresh token. Please log in again."
+4. **Human 429 body** (user request): "Too many login attempts. You can try
+   again in 28 seconds." + `details.retry_after_seconds`; scope-specific
+   wording (login/registration); `Retry-After` header retained.
+
+Verified 2×: pytest 26/26 (idempotent-logout + whitespace + 429-body tests),
+ruff + mypy clean; rebuilt image → live curl: stale-token logout 204
+(the user's exact scenario), live-token 204, repeat-logout 204, garbage 204,
+whitespace-padded refresh 200, 429 body message with correct seconds.

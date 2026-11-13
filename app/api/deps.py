@@ -46,8 +46,18 @@ async def get_current_user(
     return user
 
 
+def format_retry_after(seconds: int) -> str:
+    """Human wording for the 429 body: '29 seconds' / '2 minutes'."""
+    if seconds < 60:
+        unit = "second" if seconds == 1 else "seconds"
+        return f"{seconds} {unit}"
+    minutes = max(1, seconds // 60)  # partial minutes round up to 1+
+    unit = "minute" if minutes == 1 else "minutes"
+    return f"{minutes} {unit}"
+
+
 def rate_limit(
-    scope: str, limit: int, window_seconds: int = 60
+    scope: str, limit: int, window_seconds: int = 60, action: str = "request"
 ) -> Callable[..., Awaitable[None]]:
     """Dependency factory: fixed-window limiter keyed by client IP + scope.
 
@@ -65,8 +75,14 @@ def rate_limit(
         ip = request.client.host if request.client else "unknown"
         result = await limiter.hit(scope, ip, limit, window_seconds)
         if not result.allowed:
+            # Machines read the Retry-After header; humans read the body.
             raise RateLimitedError(
-                headers={"Retry-After": str(result.reset_after)}
+                message=(
+                    f"Too many {action} attempts. "
+                    f"You can try again in {format_retry_after(result.reset_after)}."
+                ),
+                details={"retry_after_seconds": result.reset_after},
+                headers={"Retry-After": str(result.reset_after)},
             )
 
     return _dependency

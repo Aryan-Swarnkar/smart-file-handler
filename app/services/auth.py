@@ -32,7 +32,7 @@ from app.services.security import (
 logger = get_logger(__name__)
 
 INVALID_LOGIN_MESSAGE = "Invalid email or password."
-INVALID_REFRESH_MESSAGE = "Invalid refresh token."
+INVALID_REFRESH_MESSAGE = "Invalid or expired refresh token. Please log in again."
 
 
 class LoginResult(NamedTuple):
@@ -99,7 +99,9 @@ class AuthService:
         return LoginResult(user.id, access_token, raw_refresh, expires_in)
 
     async def refresh(self, raw_refresh: str) -> RefreshResult:
-        row = await self._tokens.get_by_hash(hash_refresh_token(raw_refresh))
+        # strip(): tokens arrive copy-pasted; a trailing newline/space would
+        # silently change the SHA-256 and fail a "correct" token.
+        row = await self._tokens.get_by_hash(hash_refresh_token(raw_refresh.strip()))
         if row is None:
             raise UnauthorizedError(INVALID_REFRESH_MESSAGE, code="invalid_refresh_token")
 
@@ -137,11 +139,20 @@ class AuthService:
         return RefreshResult(row.user_id, access_token, raw_new, expires_in)
 
     async def logout(self, raw_refresh: str) -> None:
-        row = await self._tokens.get_by_hash(hash_refresh_token(raw_refresh))
-        # Unknown or already-revoked: reject rather than silently succeed so a
-        # client cannot "log out" with garbage and believe it secured anything.
-        if row is None or row.revoked_at is not None:
-            raise UnauthorizedError(INVALID_REFRESH_MESSAGE, code="invalid_refresh_token")
-        await self._tokens.revoke(row)
-        await self._session.commit()
-        logger.info("refresh_token_revoked", user_id=str(row.user_id))
+        """Idempotent logout (RFC 7009 revocation semantics): ALWAYS succeeds.
+
+        Live token → revoked. Unknown, already-revoked, or garbage → silent
+        no-op, same 204. A uniform response (a) can never break the client's
+        logout flow — e.g. after refresh rotation or a reuse-detection family
+        nuke made the held token stale — and (b) removes the "does this token
+        hash exist?" probing oracle a 401 would create.
+        """
+        token_hash = hash_refresh_token(raw_refresh.strip())
+        row = await self._tokens.get_by_hash(token_hash)
+        if row is not None and row.revoked_at is None:
+            await self._tokens.revoke(row)
+            await self._session.commit()
+            logger.info("refresh_token_revoked", user_id=str(row.user_id))
+        else:
+            # Nothing to change; no commit needed. Logged for supportability.
+            logger.info("logout_noop", token_known=row is not None)

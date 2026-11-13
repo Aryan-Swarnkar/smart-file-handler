@@ -44,13 +44,35 @@ issue A ─▶ use A ─▶ issue B, A revoked (replaced_by_id = B)
 - `replaced_by_id` chain = full audit trail of every session lineage.
 - Hash lookups are unique-indexed (`token_hash`) — O(1).
 
+## Logout (P2.1 — RFC 7009 idempotent)
+
+`POST /auth/logout` **always returns 204**. Live token → revoked. Unknown /
+already-revoked / garbage → silent no-op. Presented token is `.strip()`ed.
+
+Why this is correct (and better than strict 401):
+
+- **Client UX**: logout can never fail. Before the fix, `refresh` → `logout`
+  with the old token returned 401 because rotation had already killed it —
+  a real user-reported bug (2026-11-13). Same after a reuse-detection
+  family nuke.
+- **Oracle elimination**: a uniform 204 removes the only way to probe
+  "does this token hash exist in the DB?" (the old 401 leaked that bit).
+- RFC 7009 (OAuth Token Revocation) explicitly recommends responding 200
+  even for invalid tokens at revocation endpoints for this reason.
+
+Trade-off: a client passing garbage "believes" it logged out — but the
+token it holds is useless for anything else anyway; nothing is lost.
+
 ## Rate limiting (credential stuffing)
 
 Fixed window: Redis `INCR rl:{ns}:{scope}:{ip}` + `EXPIRE 60` on first hit.
 Redis counters (not process memory) → correct with N API replicas behind an
 LB, which in-process limits (slowapi per-worker dicts) are not. 429 carries
-`Retry-After` = window TTL. Fail-open on Redis outage: availability of auth
-beats strict limiting; argon2 cost remains the per-attempt brake.
+`Retry-After` (seconds until window resets) AND a human message in the body:
+`"Too many login attempts. You can try again in 29 seconds."` + `details.
+retry_after_seconds` — machines parse the header, users read the message.
+Fail-open on Redis outage: availability of auth beats strict limiting;
+argon2 cost remains the per-attempt brake.
 
 ## Request validation
 

@@ -46,7 +46,7 @@ Browser/curl ──HTTP──▶ API (uvicorn, FastAPI) ──▶ structlog JSON
 | `tests/conftest.py` | env bootstrapping before app import, `client` fixture (lifespan-aware), real compose Redis + per-run rate-limit namespace | all tests |
 | `tests/test_smoke.py` | P0 endpoint contract tests (incl. dead-redis readiness) | pytest |
 | `tests/test_db_integration.py` | pgvector roundtrip + cosine NN + enum persistence (rollback-isolated) | pytest |
-| `tests/test_auth.py` | 17 auth integration tests (register/login/refresh/logout/429) | pytest |
+| `tests/test_auth.py` | 18 auth integration tests (register/login/refresh/logout/429) | pytest |
 | `Dockerfile` | multi-stage build: `builder` → `api` / `worker` targets | compose, CI |
 | `docker-compose.yml` | postgres(pgvector), redis, seaweedfs(S3), api | local dev |
 | `deploy/seaweedfs/s3.json` | SeaweedFS S3 credentials (dev creds `minioadmin`) | s3 container |
@@ -217,12 +217,27 @@ client ──refresh(A)──▶ lookup sha256(A)
                                   return pair(B)
 ```
 Each token is single-use; a replayed one is evidence of theft → the whole
-family dies and every device must re-login. Verified live in P2 pass 2.
+family dies and every device must re-login. Presented tokens are `.strip()`ed
+first (P2.1: whitespace in copy-pasted tokens used to fail silently).
+Verified live in P2 pass 2.
 
-**Logout**: presents refresh token → lookup → unknown/revoked → 401 (no
-silent success oracle) → live → revoke, commit, 204. Access token keeps
-working ≤15 min (stateless JWT trade-off; no blacklist — short expiry is
-the bound).
+**Logout** (fixed after user-reported bug, P2.1): idempotent per RFC 7009 —
+presents refresh token → `.strip()` it (copy-paste whitespace used to change
+the SHA-256 and fail a "correct" token) → lookup → live? revoke + commit;
+unknown/already-revoked? silent no-op → **always 204, no 401 possible**.
+Why uniform-success beats the old strict-401: (a) a client can never "fail
+to log out" — e.g. after refresh rotation or a reuse-detection family nuke
+made its held token stale (exactly the user's bug: refresh then logout →
+401); (b) a uniform response removes the "does this token hash exist?"
+probing oracle. Access token keeps working ≤15 min (stateless JWT
+trade-off; no blacklist — short expiry is the bound).
+
+**429 rate-limit body (P2.1)**: humans get the timing in the message, not
+just the header — `{"error": {"code": "rate_limited", "message": "Too many
+login attempts. You can try again in 28 seconds.", "details":
+{"retry_after_seconds": 28}}, "request_id": ...}` + `Retry-After: 28`
+header (RFC-mandated, machines/CDNs read it). `format_retry_after()`
+(app/api/deps.py): seconds < 60 → "N seconds", above → "M minutes".
 
 **`/auth/me`** → `get_current_user` (`app/api/deps.py`): `HTTPBearer`
 (auto_error=False so a missing header raises OUR envelope, not FastAPI's

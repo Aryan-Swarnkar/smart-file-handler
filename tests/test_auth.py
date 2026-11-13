@@ -295,9 +295,47 @@ async def test_logout_revokes_session(client: AsyncClient) -> None:
     assert still_me.status_code == 200
 
 
-async def test_logout_with_unknown_token_401(client: AsyncClient) -> None:
-    resp = await client.post("/auth/logout", json={"refresh_token": "nope"})
-    assert resp.status_code == 401
+async def test_logout_is_idempotent_rfc7009(client: AsyncClient, db: AsyncSession) -> None:
+    """Logout NEVER fails: live, rotated-away, or unknown token -> 204."""
+    email = _email()
+    await _register(client, email)
+    login = (await _login(client, email)).json()
+    live_token = login["refresh_token"]
+
+    # Rotate it away: old token is now revoked, new one is live.
+    rotated = (
+        await client.post("/auth/refresh", json={"refresh_token": live_token})
+    ).json()
+
+    # 1) Stale (revoked) token -> 204, not 401. THE bug users hit before.
+    stale = await client.post("/auth/logout", json={"refresh_token": live_token})
+    assert stale.status_code == 204
+    # 2) Unknown garbage -> 204 (also removes the token-existence oracle).
+    unknown = await client.post("/auth/logout", json={"refresh_token": "no-such-token"})
+    assert unknown.status_code == 204
+    # 3) Whitespace-padded copy-paste -> 204, and the LIVE token gets revoked.
+    padded = await client.post(
+        "/auth/logout", json={"refresh_token": f"  {rotated['refresh_token']} \n"}
+    )
+    assert padded.status_code == 204
+
+    # DB truth: every token of this user is revoked; nothing left live.
+    user = (await db.execute(select(User).where(User.email == email))).scalar_one()
+    rows = (
+        await db.execute(select(RefreshToken).where(RefreshToken.user_id == user.id))
+    ).scalars().all()
+    assert rows, "expected at least two refresh rows"
+    assert all(r.revoked_at is not None for r in rows)
+
+
+async def test_refresh_accepts_whitespace_padded_token(client: AsyncClient) -> None:
+    email = _email()
+    await _register(client, email)
+    login = (await _login(client, email)).json()
+    resp = await client.post(
+        "/auth/refresh", json={"refresh_token": f" {login['refresh_token']}\n"}
+    )
+    assert resp.status_code == 200, resp.text
 
 
 # --- rate limiting ----------------------------------------------------------------
@@ -316,6 +354,12 @@ async def test_login_rate_limited_429(client: AsyncClient) -> None:
     assert last.json()["error"]["code"] == "rate_limited"
     retry_after = int(last.headers["retry-after"])
     assert 0 <= retry_after <= 60
+    # Human-readable body: exact seconds in the message + machine field.
+    body = last.json()["error"]
+    assert body["details"]["retry_after_seconds"] == retry_after
+    assert body["message"] == (
+        f"Too many login attempts. You can try again in {retry_after} seconds."
+    )
 
 
 async def test_register_rate_limited_429(client: AsyncClient) -> None:
@@ -325,3 +369,4 @@ async def test_register_rate_limited_429(client: AsyncClient) -> None:
         last = await _register(client, _email())
     assert last is not None and last.status_code == 429
     assert "retry-after" in last.headers
+    assert "registration attempts" in last.json()["error"]["message"]

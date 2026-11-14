@@ -22,3 +22,8 @@ models-cache/
 
 # Object storage volume when not using named docker volumes
 storage/
+
+# Frontend build artifacts + dev-server caches
+web/node_modules/
+web/dist/
+web/.vite/

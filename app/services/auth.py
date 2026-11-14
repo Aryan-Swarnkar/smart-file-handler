@@ -18,6 +18,8 @@ from app.core.config import get_settings
 from app.core.errors import ConflictError, UnauthorizedError
 from app.core.logging import get_logger
 from app.db.models import User
+from app.db.models.folder import ROOT_FOLDER_NAME
+from app.repositories.folders import FolderRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.users import UserRepository
 from app.services.security import (
@@ -60,6 +62,7 @@ class AuthService:
         self._session = session
         self._users = UserRepository(session)
         self._tokens = RefreshTokenRepository(session)
+        self._folders = FolderRepository(session)
 
     async def register(self, email_raw: str, password: str) -> User:
         email = _normalize_email(email_raw)
@@ -67,11 +70,15 @@ class AuthService:
         if existing is not None:
             raise ConflictError("This email is already registered.", code="email_taken")
         try:
+            # ONE transaction: account + its root folder. Spec PHASE 3 — a
+            # registered user never browses a rootless drive; if the folder
+            # insert fails the user insert rolls back with it.
             user = await self._users.create(
                 email,
                 hash_password(password),
                 storage_quota_bytes=get_settings().default_storage_quota_bytes,
             )
+            await self._folders.create(user.id, ROOT_FOLDER_NAME, parent_id=None)
             await self._session.commit()
         except IntegrityError:
             # Lost a race against a concurrent register (unique index fired):
@@ -96,11 +103,26 @@ class AuthService:
 
         raw_refresh, refresh_hash = new_refresh_token()
         expires_at = datetime.now(UTC) + timedelta(days=get_settings().REFRESH_TOKEN_EXPIRE_DAYS)
-        await self._tokens.create(user.id, refresh_hash, expires_at)
+        # A login mints the FIRST token of a NEW family: this session's future
+        # rotations reuse this uuid, and a reuse attack revokes only it.
+        await self._tokens.create(
+            user.id, refresh_hash, expires_at, family_id=uuid.uuid4()
+        )
         access_token, expires_in = create_access_token(user.id)
         await self._session.commit()
         logger.info("user_login", user_id=str(user.id))
         return LoginResult(user.id, access_token, raw_refresh, expires_in)
+
+    async def resolve_refresh_email(self, raw_refresh: str) -> str | None:
+        """Owner email of a presented refresh token (None if unknown).
+
+        The /refresh rate-limit bucket keys on IP+email (spec); the body
+        carries no email, so the handler resolves it from the token BEFORE
+        rotating. Read-only — no state, no commit.
+        """
+        return await self._tokens.get_email_by_hash(
+            hash_refresh_token(raw_refresh.strip())
+        )
 
     async def refresh(self, raw_refresh: str) -> RefreshResult:
         # strip(): tokens arrive copy-pasted; a trailing newline/space would
@@ -111,13 +133,16 @@ class AuthService:
 
         # --- reuse detection: a revoked token presented again means the token
         # was stolen or replayed. Standard practice (OAuth rotation): revoke
-        # the user's ENTIRE live token family, forcing re-login everywhere.
+        # the whole FAMILY — every live token of THIS login session — forcing
+        # re-login on that device. The user's other sessions (other devices)
+        # survive: one stolen token must not log everyone out.
         if row.revoked_at is not None:
-            nuked = await self._tokens.revoke_all_for_user(row.user_id)
+            nuked = await self._tokens.revoke_family(row.user_id, row.family_id)
             await self._session.commit()
             logger.warning(
                 "refresh_token_reuse_detected",
                 user_id=str(row.user_id),
+                family_id=str(row.family_id),
                 revoked_tokens=nuked,
             )
             raise UnauthorizedError(INVALID_REFRESH_MESSAGE, code="invalid_refresh_token")
@@ -128,13 +153,14 @@ class AuthService:
             await self._session.commit()
             raise UnauthorizedError(INVALID_REFRESH_MESSAGE, code="invalid_refresh_token")
 
-        # --- rotation: old token dies, new one takes its place; the chain is
-        # auditable via replaced_by_id.
+        # --- rotation: old token dies, new one takes its place IN THE SAME
+        # family; the chain is auditable via replaced_by_id.
         raw_new, hash_new = new_refresh_token()
         new_row = await self._tokens.create(
             row.user_id,
             hash_new,
             now + timedelta(days=get_settings().REFRESH_TOKEN_EXPIRE_DAYS),
+            family_id=row.family_id,
         )
         await self._tokens.revoke(row, replaced_by_id=new_row.id)
         access_token, expires_in = create_access_token(row.user_id)

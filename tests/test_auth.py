@@ -8,6 +8,7 @@ per test via the per-run namespace.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncGenerator
 
@@ -19,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
-from app.db.models import RefreshToken, User
+from app.core.ratelimit import format_retry_after
+from app.db.models import Folder, RefreshToken, User
 from app.services.security import decode_access_token, hash_refresh_token
 
 _ph = PasswordHasher()
@@ -97,6 +99,64 @@ async def test_register_short_password_422(client: AsyncClient) -> None:
         "/auth/register", json={"email": _email(), "password": "short"}
     )
     assert resp.status_code == 422
+
+
+async def test_register_creates_root_folder(
+    client: AsyncClient, db: AsyncSession
+) -> None:
+    """Spec PHASE 3: registration creates user + root folder in ONE transaction."""
+    email = _email()
+    resp = await _register(client, email)
+    assert resp.status_code == 201, resp.text
+    user = (await db.execute(select(User).where(User.email == email))).scalar_one()
+    folders = (
+        await db.execute(select(Folder).where(Folder.owner_id == user.id))
+    ).scalars().all()
+    assert len(folders) == 1
+    assert folders[0].name == "My Files"
+    assert folders[0].parent_id is None  # parent_id NULL is the root marker
+
+
+async def test_concurrent_register_same_email_exactly_one_success(
+    client: AsyncClient, db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec PHASE 3: N racing registrations -> exactly one 201, the rest 409.
+
+    Every request runs its own transaction; the DB unique index is the
+    arbiter. Losers are caught by the service's IntegrityError path and must
+    leave NO partial rows (user+folder commit atomically or not at all).
+    The register bucket is raised so the RATE LIMITER doesn't 429 the race
+    participants before they reach the DB (capacity 5 < 8 racers otherwise).
+    monkeypatch restores the env; the explicit cache_clear is required because
+    the client fixture's lifespan startup re-populated the cache (with the
+    default 5) BEFORE this body ran.
+    """
+    monkeypatch.setenv("REGISTER_RATELIMIT_PER_MINUTE", "100")
+    get_settings.cache_clear()
+    email = _email()
+    responses = await asyncio.gather(
+        *[
+            client.post(
+                "/auth/register", json={"email": email, "password": "correct-horse-1"}
+            )
+            for _ in range(8)
+        ]
+    )
+    created = [r for r in responses if r.status_code == 201]
+    conflicts = [r for r in responses if r.status_code == 409]
+    assert len(created) == 1, [r.status_code for r in responses]
+    assert len(conflicts) == 7, [r.status_code for r in responses]
+    users = (
+        await db.execute(select(User).where(User.email == email))
+    ).scalars().all()
+    assert len(users) == 1
+    # The atomic registration also means exactly ONE root folder, no orphans.
+    folders = (
+        await db.execute(
+            select(Folder).where(Folder.owner_id == users[0].id)
+        )
+    ).scalars().all()
+    assert len(folders) == 1
 
 
 # --- login --------------------------------------------------------------------
@@ -250,6 +310,99 @@ async def test_refresh_reuse_revokes_entire_family(
     assert all(r.revoked_at is not None for r in rows)
 
 
+async def test_refresh_reuse_spares_other_families(
+    client: AsyncClient, db: AsyncSession
+) -> None:
+    """Reuse revokes ONE login session (the family), not the user's others."""
+    email = _email()
+    await _register(client, email)
+    family_a = (await _login(client, email)).json()
+    family_b = (await _login(client, email)).json()  # second device/session
+
+    # Rotate family A away normally: A1 -> A2 (A1 is now revoked).
+    rotated = (
+        await client.post(
+            "/auth/refresh", json={"refresh_token": family_a["refresh_token"]}
+        )
+    ).json()
+
+    # Reuse the rotated-away A1 -> family A dies...
+    reuse = await client.post(
+        "/auth/refresh", json={"refresh_token": family_a["refresh_token"]}
+    )
+    assert reuse.status_code == 401
+
+    # ...family B (the other device) still refreshes: 200, not 401.
+    survivor = await client.post(
+        "/auth/refresh", json={"refresh_token": family_b["refresh_token"]}
+    )
+    assert survivor.status_code == 200, survivor.text
+    survivor_token = survivor.json()["refresh_token"]
+
+    user = (await db.execute(select(User).where(User.email == email))).scalar_one()
+    rows = (
+        await db.execute(select(RefreshToken).where(RefreshToken.user_id == user.id))
+    ).scalars().all()
+    row_a = next(r for r in rows if r.token_hash == hash_refresh_token(family_a["refresh_token"]))
+    row_b = next(r for r in rows if r.token_hash == hash_refresh_token(family_b["refresh_token"]))
+    assert row_a.family_id != row_b.family_id  # two logins = two families
+    # EVERY family-A token is dead — including A2, which was still fresh.
+    rotated_row = next(
+        r for r in rows if r.token_hash == hash_refresh_token(rotated["refresh_token"])
+    )
+    assert rotated_row.family_id == row_a.family_id
+    family_a_rows = [r for r in rows if r.family_id == row_a.family_id]
+    assert len(family_a_rows) == 2
+    assert all(r.revoked_at is not None for r in family_a_rows)
+    # Family B survived the nuke: B1 itself is revoked only because OUR
+    # survivor call rotated it — the proof of survival is its rotation
+    # child, which is live and carries family B's id.
+    survivor_row = next(
+        r for r in rows if r.token_hash == hash_refresh_token(survivor_token)
+    )
+    assert survivor_row.family_id == row_b.family_id
+    assert survivor_row.revoked_at is None
+
+
+async def test_login_mints_new_family_rotation_stays_in_it(
+    client: AsyncClient, db: AsyncSession
+) -> None:
+    email = _email()
+    await _register(client, email)
+    first = (await _login(client, email)).json()
+    second = (await _login(client, email)).json()
+
+    row1 = (
+        await db.execute(
+            select(RefreshToken).where(
+                RefreshToken.token_hash == hash_refresh_token(first["refresh_token"])
+            )
+        )
+    ).scalar_one()
+    row2 = (
+        await db.execute(
+            select(RefreshToken).where(
+                RefreshToken.token_hash == hash_refresh_token(second["refresh_token"])
+            )
+        )
+    ).scalar_one()
+    assert row1.family_id != row2.family_id  # each login starts a new family
+
+    refreshed = (
+        await client.post(
+            "/auth/refresh", json={"refresh_token": first["refresh_token"]}
+        )
+    ).json()
+    row3 = (
+        await db.execute(
+            select(RefreshToken).where(
+                RefreshToken.token_hash == hash_refresh_token(refreshed["refresh_token"])
+            )
+        )
+    ).scalar_one()
+    assert row3.family_id == row1.family_id  # rotation stays inside the family
+
+
 async def test_refresh_unknown_token_401(client: AsyncClient) -> None:
     resp = await client.post("/auth/refresh", json={"refresh_token": "no-such-token"})
     assert resp.status_code == 401
@@ -336,19 +489,40 @@ async def test_login_rate_limited_429(client: AsyncClient) -> None:
     assert last.json()["error"]["code"] == "rate_limited"
     retry_after = int(last.headers["retry-after"])
     assert 0 <= retry_after <= 60
-    # Human-readable body: exact seconds in the message + machine field.
+    # Human-readable body: wording via the shared formatter (handles the
+    # 1-second singular) + machine-readable seconds field.
     body = last.json()["error"]
     assert body["details"]["retry_after_seconds"] == retry_after
     assert body["message"] == (
-        f"Too many login attempts. You can try again in {retry_after} seconds."
+        f"Too many login attempts. You can try again in {format_retry_after(retry_after)}."
     )
 
 
 async def test_register_rate_limited_429(client: AsyncClient) -> None:
+    """Hammer ONE email: its (email, ip) bucket fills, then 429s. (Distinct
+    emails get their own buckets — per the approved key design.)"""
     limit = get_settings().REGISTER_RATELIMIT_PER_MINUTE
+    email = _email()
     last = None
     for _i in range(limit + 2):
-        last = await _register(client, _email())
+        last = await _register(client, email)
     assert last is not None and last.status_code == 429
     assert "retry-after" in last.headers
     assert "registration attempts" in last.json()["error"]["message"]
+
+
+async def test_refresh_rate_limited_429(client: AsyncClient) -> None:
+    """Garbage-token hammering shares ONE ip-only sentinel bucket per IP."""
+    limit = get_settings().REFRESH_RATELIMIT_PER_MINUTE
+    last = None
+    for _i in range(limit + 2):
+        last = await client.post(
+            "/auth/refresh", json={"refresh_token": "no-such-token"}
+        )
+    assert last is not None and last.status_code == 429
+    assert last.json()["error"]["code"] == "rate_limited"
+    assert "refresh attempts" in last.json()["error"]["message"]
+    assert int(last.headers["retry-after"]) >= 1
+    assert last.json()["error"]["details"]["retry_after_seconds"] == int(
+        last.headers["retry-after"]
+    )

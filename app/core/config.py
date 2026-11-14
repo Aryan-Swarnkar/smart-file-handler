@@ -57,13 +57,15 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # --- rate limiting (auth endpoints; per client IP) -------------------------
-    # Fixed-window implementation until Phase 3 swaps in the atomic Redis Lua
-    # token bucket. Namespace isolates key spaces (multi-replica shares Redis;
-    # tests get a unique per-run namespace so counters never leak between runs).
+    # --- rate limiting (auth endpoints; atomic Redis Lua token bucket) --------
+    # Capacity = knob per minute, refill = knob/60 per second (burst-capable,
+    # same average). Keyed by IP + sha256(email) (Phase 3). Namespace isolates
+    # key spaces (multi-replica shares Redis; tests get a unique per-run
+    # namespace so counters never leak between runs).
     RATELIMIT_NAMESPACE: str = "rl"
     LOGIN_RATELIMIT_PER_MINUTE: int = 10
     REGISTER_RATELIMIT_PER_MINUTE: int = 5
+    REFRESH_RATELIMIT_PER_MINUTE: int = 30
 
     # --- infrastructure ------------------------------------------------------
     DATABASE_URL: str

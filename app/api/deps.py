@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -12,11 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import RateLimitedError, UnauthorizedError
+from app.core.ratelimit import TokenBucketLimiter, format_retry_after
 from app.db.models import User
 from app.db.session import get_session
 from app.services.auth import AuthService
 from app.services.file_service import FileService
-from app.services.rate_limit import RateLimiter
 from app.services.security import decode_access_token
 from app.services.storage_service import StorageService
 
@@ -48,46 +47,51 @@ async def get_current_user(
     return user
 
 
-def format_retry_after(seconds: int) -> str:
-    """Human wording for the 429 body: '29 seconds' / '2 minutes'."""
-    if seconds < 60:
-        unit = "second" if seconds == 1 else "seconds"
-        return f"{seconds} {unit}"
-    minutes = max(1, seconds // 60)  # partial minutes round up to 1+
-    unit = "minute" if minutes == 1 else "minutes"
-    return f"{minutes} {unit}"
+async def enforce_auth_rate_limit(
+    request: Request,
+    redis: Redis,
+    bucket: str,
+    email: str,
+    *,
+    action: str,
+) -> None:
+    """Token-bucket gate for one auth request (spec PHASE 3).
 
+    Called INSIDE the register/login/refresh handlers (P3-5): the bucket key
+    includes the body's email, which a parameter-less dependency factory
+    cannot see. /refresh passes the token-owner's email resolved from the
+    presented token (empty string -> shared ip-only sentinel bucket for
+    garbage tokens).
 
-def rate_limit(
-    scope: str, limit: int, window_seconds: int = 60, action: str = "request"
-) -> Callable[..., Awaitable[None]]:
-    """Dependency factory: fixed-window limiter keyed by client IP + scope.
+    The per-minute knob is read at CALL time (get_settings(), cache cleared
+    per test by conftest) so tests can raise a bucket's capacity via env;
+    production reads it once per request — same value every time.
 
-    `limit` is read once at import time (same import-time settings pattern as
-    the DB engine URL); counters live in Redis, shared by all replicas.
+    Behind a proxy `ip` is the proxy's IP unless X-Forwarded-For is trusted;
+    that switch lands with the deployment phase.
     """
-
-    async def _dependency(
-        request: Request,
-        redis: Annotated[Redis, Depends(get_redis)],
-    ) -> None:
-        limiter = RateLimiter(redis, get_settings().RATELIMIT_NAMESPACE)
-        # Behind a proxy this is the proxy's IP unless X-Forwarded-For is
-        # trusted; that switch lands with the deployment phase (P9).
-        ip = request.client.host if request.client else "unknown"
-        result = await limiter.hit(scope, ip, limit, window_seconds)
-        if not result.allowed:
-            # Machines read the Retry-After header; humans read the body.
-            raise RateLimitedError(
-                message=(
-                    f"Too many {action} attempts. "
-                    f"You can try again in {format_retry_after(result.reset_after)}."
-                ),
-                details={"retry_after_seconds": result.reset_after},
-                headers={"Retry-After": str(result.reset_after)},
-            )
-
-    return _dependency
+    settings = get_settings()
+    if bucket == "register":
+        per_minute = settings.REGISTER_RATELIMIT_PER_MINUTE
+    elif bucket == "login":
+        per_minute = settings.LOGIN_RATELIMIT_PER_MINUTE
+    elif bucket == "refresh":
+        per_minute = settings.REFRESH_RATELIMIT_PER_MINUTE
+    else:  # pragma: no cover — call sites are typed to the three above
+        raise ValueError(f"Unknown rate-limit bucket: {bucket!r}")
+    limiter = TokenBucketLimiter(redis, settings.RATELIMIT_NAMESPACE)
+    ip = request.client.host if request.client else "unknown"
+    result = await limiter.hit(bucket, email, ip, per_minute)
+    if not result.allowed:
+        # Machines read the Retry-After header; humans read the body.
+        raise RateLimitedError(
+            message=(
+                f"Too many {action} attempts. "
+                f"You can try again in {format_retry_after(result.retry_after_seconds)}."
+            ),
+            details={"retry_after_seconds": result.retry_after_seconds},
+            headers={"Retry-After": str(result.retry_after_seconds)},
+        )
 
 
 def auth_service(session: Annotated[AsyncSession, Depends(get_session)]) -> AuthService:

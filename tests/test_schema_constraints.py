@@ -223,11 +223,18 @@ async def test_refresh_token_hash_unique(db: AsyncSession) -> None:
     owner = await _user(db, "rt-hash@example.com")
     expires = datetime.now(UTC) + timedelta(days=1)
     db.add(
-        RefreshToken(user_id=owner.id, token_hash="4" * 64, expires_at=expires)
+        RefreshToken(
+            user_id=owner.id, token_hash="4" * 64, expires_at=expires,
+            family_id=owner.id,  # Phase 3: family_id is NOT NULL
+        )
     )
     await db.flush()
     await _violates(
-        db, RefreshToken(user_id=owner.id, token_hash="4" * 64, expires_at=expires)
+        db,
+        RefreshToken(
+            user_id=owner.id, token_hash="4" * 64, expires_at=expires,
+            family_id=uuid.uuid4(),
+        ),
     )
 
 

@@ -1,18 +1,27 @@
 """Auth API: register, login, refresh, logout, me.
 
-Rate limiting: login and register are throttled per client IP (env-tunable).
-Password strength beyond min length is argon2's job; enumeration is defeated
-by identical 401 messages + timing-equalized unknown-email handling.
+Rate limiting (Phase 3): register/login/refresh pass through an atomic Redis
+Lua token bucket keyed by IP+email (deps.enforce_auth_rate_limit). The call
+sits in the handlers because the bucket key needs the body's email. /refresh
+resolves the presented token's owner first (unknown tokens share the
+ip-only sentinel bucket). Password strength beyond min length is argon2's
+job; enumeration is defeated by identical 401 messages + timing-equalized
+unknown-email handling.
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
+from redis.asyncio import Redis
 
-from app.api.deps import AuthedService, CurrentUser, rate_limit
-from app.core.config import get_settings
+from app.api.deps import (
+    AuthedService,
+    CurrentUser,
+    enforce_auth_rate_limit,
+    get_redis,
+)
 from app.schemas.auth import (
     LoginIn,
     LogoutIn,
@@ -21,8 +30,6 @@ from app.schemas.auth import (
     TokenPair,
     UserOut,
 )
-
-_settings = get_settings()
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -35,16 +42,17 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 )
 async def register(
     payload: RegisterIn,
+    request: Request,
+    redis: Annotated[Redis, Depends(get_redis)],
     service: AuthedService,
-    _rl: Annotated[
-        None,
-        Depends(
-            rate_limit(
-                "auth:register", _settings.REGISTER_RATELIMIT_PER_MINUTE, action="registration"
-            )
-        ),
-    ],
 ) -> UserOut:
+    await enforce_auth_rate_limit(
+        request,
+        redis,
+        "register",
+        payload.email,
+        action="registration",
+    )
     user = await service.register(payload.email, payload.password.get_secret_value())
     return UserOut.model_validate(user)
 
@@ -52,14 +60,17 @@ async def register(
 @router.post("/login", response_model=TokenPair, summary="Exchange credentials for tokens")
 async def login(
     payload: LoginIn,
+    request: Request,
+    redis: Annotated[Redis, Depends(get_redis)],
     service: AuthedService,
-    _rl: Annotated[
-        None,
-        Depends(
-            rate_limit("auth:login", _settings.LOGIN_RATELIMIT_PER_MINUTE, action="login")
-        ),
-    ],
 ) -> TokenPair:
+    await enforce_auth_rate_limit(
+        request,
+        redis,
+        "login",
+        payload.email,
+        action="login",
+    )
     result = await service.login(payload.email, payload.password.get_secret_value())
     return TokenPair(
         access_token=result.access_token,
@@ -71,8 +82,21 @@ async def login(
 @router.post("/refresh", response_model=TokenPair, summary="Rotate the refresh token")
 async def refresh(
     payload: RefreshIn,
+    request: Request,
+    redis: Annotated[Redis, Depends(get_redis)],
     service: AuthedService,
 ) -> TokenPair:
+    # The body carries no email: resolve the token's owner BEFORE rotating so
+    # the bucket keys on IP+email per spec. None -> "" = shared ip-only
+    # sentinel bucket (hash("") is a stable constant).
+    email = await service.resolve_refresh_email(payload.refresh_token) or ""
+    await enforce_auth_rate_limit(
+        request,
+        redis,
+        "refresh",
+        email,
+        action="refresh",
+    )
     result = await service.refresh(payload.refresh_token)
     return TokenPair(
         access_token=result.access_token,

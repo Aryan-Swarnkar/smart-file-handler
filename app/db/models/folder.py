@@ -15,6 +15,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, CreatedAtMixin
 
+# The per-user root created in the SAME transaction as the account (P3-1).
+# Shared by the service and the migration backfill so the literal cannot
+# drift between code and data migration.
+ROOT_FOLDER_NAME = "My Files"
+
 
 class Folder(Base, CreatedAtMixin):
     __tablename__ = "folders"

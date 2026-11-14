@@ -476,31 +476,98 @@ the SeaweedFS bucket CORS). `npm run build` = strict `tsc` + Vite bundle.
    recursively (`readEntries` looped until an empty batch — it returns in
    pages of ~100). No entries (synthetic drop, plain files) → fall back to
    `dataTransfer.files`.
-2. Each file joins the queue: client-side 25 MB pre-check (oversize →
-   `failed` badge immediately; the server's 422 `details.max_bytes` stays
-   authoritative), else `waiting`.
+2. Each file joins the queue: client-side pre-checks — **0-byte → `file_empty`
+   and > 25 MB → `file_too_large` both fail instantly with ONE deduped toast
+   per batch** (no pointless network round trip per junk file; the server's
+   422 `details.max_bytes` stays authoritative), else `waiting`.
 3. Concurrency 3: per file `POST /files/init` (201) → **XHR** PUT of the raw
    File to the presigned URL with `upload.progress` events (0–90% bar) →
    `POST /files/{id}/complete` (200) → `done`, or `♻️ dedup` when the
    response's `deduplicated: true`. XHR (not fetch) is the only browser
    primitive with upload progress + abort.
-4. Cancel: AbortController → `xhr.abort()` → item marked `canceled`. The
-   orphan init row (never completed) is swept by the P4 worker by design.
+4. Cancel works at BOTH stages: a not-yet-claimed (`waiting`) item is marked
+   `canceled` directly; a claimed item's `AbortController` fires `xhr.abort()`
+   → item marked `canceled`. A cancel clicked while `/files/init` is still in
+   flight is honored by a post-await `signal.aborted` check (the abort listener
+   can't exist before the XHR does). No Cancel button is offered during
+   `finalizing` — bytes are already stored, so a cancel there would silently
+   do nothing. The orphan init row (never completed) is swept by the P4
+   worker by design.
 5. `Retry failed` re-queues only `failed` items; `Clear finished` drops
    done/dedup/canceled rows. Every successful complete bumps the grid's
    `refreshSignal` → page 1 refetch.
 
-**Browse** (`components/FileGrid.tsx`): cards from real keyset pagination
-(`next_cursor` passed back verbatim, "Load more" appends). Kind/status/topic
-filters refetch page 1; a **seq guard** makes a stale in-flight response a
-no-op (rapid filter flips otherwise let the last-ARRIVING response win, not
-the last-ISSUED request). View/download fetch presigned URLs (`download=true`
-adds the attachment disposition). Rename = double-click → inline form →
+**Browse** (`components/FileGrid.tsx`): files are grouped into **kind folders**
+(Images / PDFs / Documents / Text / Other — collapsible, open by default, with
+live counts; the grouping is the primary organization, kind/status/topic
+dropdowns remain for power use) built over the real keyset pagination
+(`next_cursor` passed back verbatim, "Load more" appends into folders). A
+**seq guard** makes a stale in-flight response a no-op (rapid filter flips
+otherwise let the last-ARRIVING response win, not the last-ISSUED request);
+`refreshSignal` bumps are debounced 400 ms so a big upload drain coalesces
+into one page-1 refetch. **View** opens the tab SYNCHRONOUSLY inside the
+click handler (`window.open("about:blank")`, then navigated once the
+presigned URL arrives — any await before `window.open` lets transient user
+activation expire and the popup is blocked SILENTLY; a hard-blocked popup
+falls back to an anchor click). **Download** fetches the presigned bytes into
+a blob and hands them to the browser via an object-URL anchor with the
+ORIGINAL filename — verified live: SeaweedFS ignores the signed
+`response-content-disposition=attachment` override and serves `inline`, so a
+plain anchor click used to NAVIGATE the app tab away (Chrome rendered PDFs
+inline and the whole UI "disappeared"). Rename = double-click → inline form →
 `PATCH`. Delete = `window.confirm` → `DELETE` → row removed locally.
 
 **Test aids**: `StatusStrip` polls the PUBLIC `/readyz` every 15s and shows a
 dot per dependency + "all up"/"degraded"/"API unreachable". `Toaster` renders
 429s with a live countdown built from `details.retry_after_seconds`.
+
+## Workflow 11.1 — UI stability + folders (bug-fix round, `web/`)
+
+Zero backend changes. Three user-reported bugs — "can't view files after
+uploading", "UI shakes up and down when an upload fails", "files should be in
+folders, not manual filters" — plus everything a stress reproduction
+surfaced.
+
+**Root cause of the shake**: dropping a big folder put ~2,000 queue rows in
+the DOM, each re-rendering on every XHR progress tick (~30/s), while every
+completion refetched the grid and every failure appended a toast — the page
+jumped around continuously (measured layout-shift total 3.49 for one drain).
+
+**Fixes (all measured, not guessed)**:
+
+- **Bounded swap-strip queue** (`UploadQueue.tsx`): 5 equal-height slot rows
+  whose CONTENT swaps as files drain — rows are never removed mid-drain. The
+  slot count grows with demand but never shrinks while the queue is visible
+  (high-water `slotFloorRef`, reset when the queue fully empties), so a
+  1-file upload shows 1 row, not 5 blank ones. Failed rows capped at 20
+  ("…and N more failed"); finished items collapse into a counts line
+  (`✅ N done · ♻️ N dup · 🚫 N canceled` + Clear). Reserved heights
+  everywhere: `.qi-bar.idle`, `.queue-group-label.idle`, `.queue-actions.idle`,
+  `.queue-more.idle` — visibility toggles, existence never does. Progress
+  patches throttled to ~8/s; rows memoized. Layout-shift total for the same
+  drain: **3.49 → 0.19** (the residue is one-time content arrival).
+- **Toast dedupe + stable anchoring** (`Toaster.tsx`): identical events
+  (kind+title+detail, request_id suffix stripped from the key) BUMP one row
+  (×N badge + timer restart) instead of stacking — a 45-file failing batch
+  produces ONE toast, not 45. The authoritative list is a ref mutated
+  synchronously in the handler (a render-mirror lags behind synchronous
+  bursts). Newest-first DOM in a bottom-anchored column: add/evict/timeout
+  move nothing already on screen. Cap 5 rows, 6s timers.
+- **Sync-open View** (`FileGrid.tsx`): `window.open` first, fetch second —
+  see Workflow 11's Browse note.
+- **Blob download**: SeaweedFS ignores `response-content-disposition`
+  (verified) — see Workflow 11's Browse note.
+- **Instant client pre-checks**: oversize AND empty files fail with a deduped
+  toast at drop time; identical server rejections (e.g. after Retry failed)
+  dedupe too because the request_id suffix is stripped from the toast key.
+
+**Verification** (automation browser, real stack): view (text/png/docx,
+popup-block fallback), toast dedupe (×5/×6 bump, byte-identical row
+positions), 60-file mixed drains (bounded DOM, dedup badges, cancel counts),
+cancel during init (zero PUTs, zero completes) and on a waiting item (never
+claimed), UI delete with the real confirm dialog, rename, filters,
+collapse/expand, reload persistence, zero console errors. Backend gates
+twice: ruff + mypy + pytest + p3_live_check (29/29) + p4_live_check (10/10).
 
 ## Workflow 12 — Queue + worker (Phase 4)
 

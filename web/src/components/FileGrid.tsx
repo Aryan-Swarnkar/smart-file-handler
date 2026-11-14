@@ -1,10 +1,21 @@
-/** File browser: card grid over the REAL keyset pagination (cursor + Load
- * more), kind/status/topic filters, and per-file actions: view (presigned
- * URL), download (Content-Disposition attachment), rename, hard delete. */
+/** File browser: files grouped into FOLDERS by kind (Images / PDFs /
+ * Documents / Text / Other — the organization is visible at a glance, no
+ * filter fiddling), over the REAL keyset pagination (cursor + Load more).
+ * Per-file actions: view (presigned URL), download (attachment disposition),
+ * rename, hard delete. Kind/status/topic filters stay for power use.
+ *
+ * The View action opens its tab SYNCHRONOUSLY in the click handler: browsers
+ * only honor window.open while transient user activation is alive, and any
+ * await before the open (or a busy main thread) can let it expire → the
+ * popup is blocked SILENTLY, which reads as "the View button does nothing".
+ * The blank tab is navigated once the presigned URL arrives; a hard-blocked
+ * popup falls back to an anchor click, so View can never fail silently.
+ */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { deleteFile, getFileUrl, listFiles, renameFile } from "../api/files";
-import type { FileOut } from "../types";
+import { ApiError } from "../api/client";
+import type { FileKind, FileOut } from "../types";
 import { fmtBytes, fmtDate } from "../types";
 import { toastError } from "./Toaster";
 
@@ -16,6 +27,16 @@ const KIND_ICON: Record<string, string> = {
   other: "📦",
 };
 
+/** Folder sections, in display order. `null` kind (init rows that never
+ * completed — transient, swept server-side) groups under "other". */
+const FOLDERS: { key: FileKind; label: string; icon: string }[] = [
+  { key: "image", label: "Images", icon: "🖼️" },
+  { key: "pdf", label: "PDFs", icon: "📕" },
+  { key: "document", label: "Documents", icon: "📄" },
+  { key: "text", label: "Text files", icon: "📝" },
+  { key: "other", label: "Other", icon: "📦" },
+];
+
 const STATUS_CLASS: Record<string, string> = {
   uploaded: "chip uploaded",
   processing: "chip processing",
@@ -24,6 +45,9 @@ const STATUS_CLASS: Record<string, string> = {
 };
 
 const PAGE = 20;
+/** Debounce for refreshSignal (one bump per completed upload): a 2000-file
+ * drop used to trigger 2000 page-1 refetches; coalesce them. */
+const REFRESH_DEBOUNCE_MS = 400;
 
 interface Filters {
   kind: string;
@@ -38,11 +62,20 @@ interface Props {
   refreshSignal: number;
 }
 
+interface FolderGroup {
+  key: FileKind;
+  label: string;
+  icon: string;
+  files: FileOut[];
+}
+
 export function FileGrid({ refreshSignal }: Props): React.JSX.Element {
   const [items, setItems] = useState<FileOut[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  // Folder collapse state: absent key = open (folders start expanded).
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   // Stale-response guard: rapid filter changes leave several fetches in
   // flight; only the response of the LATEST fetch may touch state.
   const seqRef = useRef(0);
@@ -74,10 +107,11 @@ export function FileGrid({ refreshSignal }: Props): React.JSX.Element {
     [cursor, filters],
   );
 
-  // Reset (filters changed / refresh signal) — depends only on FILTERS, so a
-  // cursor change doesn't re-trigger it.
+  // Reset on filter/refresh changes — debounced so a burst of upload
+  // completions coalesces into one refetch (refreshSignal bumps per file).
   useEffect(() => {
-    void fetchPage("reset");
+    const handle = window.setTimeout(() => void fetchPage("reset"), REFRESH_DEBOUNCE_MS);
+    return () => window.clearTimeout(handle);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters, refreshSignal]);
 
@@ -85,22 +119,67 @@ export function FileGrid({ refreshSignal }: Props): React.JSX.Element {
     setFilters((f) => ({ ...f, [key]: value }));
   }
 
-  async function view(file: FileOut): Promise<void> {
-    try {
-      const { url } = await getFileUrl(file.id, false);
-      window.open(url, "_blank", "noopener");
-    } catch (err) {
-      toastError(err);
-    }
+  function toggleFolder(key: string): void {
+    setCollapsed((prev) => ({ ...prev, [key]: !(prev[key] !== false) }));
   }
 
+  /** View: open the tab FIRST (inside the click's user-activation window —
+   * the ONLY reliable way; any await before window.open risks a silent
+   * popup block), then navigate it when the presigned URL arrives. */
+  function view(file: FileOut): void {
+    const win = window.open("about:blank", "_blank");
+    if (win) win.opener = null; // noopener semantics while still same-origin
+    void getFileUrl(file.id, false)
+      .then(({ url }) => {
+        if (win) {
+          win.location.href = url;
+        } else {
+          // Hard popup block: anchor fallback (no await in between, so the
+          // activation is still alive) — never fail silently.
+          const a = document.createElement("a");
+          a.href = url;
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.click();
+        }
+      })
+      .catch((err) => {
+        try {
+          win?.close();
+        } catch {
+          /* tab already navigated or closed */
+        }
+        toastError(err);
+      });
+  }
+
+  /** Download: fetch the presigned bytes into a blob and hand them to the
+   * browser via an object-URL anchor with the ORIGINAL filename.
+   *
+   * Why not a plain anchor to the presigned URL? Verified live: SeaweedFS
+   * ignores the signed `response-content-disposition=attachment` override and
+   * serves `inline`, so an anchor click NAVIGATES the app tab and Chrome
+   * renders the file in place (PDF/text/image) instead of downloading —
+   * "Download" made the whole UI vanish. A blob: anchor always downloads,
+   * never navigates, and names the file correctly (the backend can only name
+   * it after the storage-key uuid). Bucket CORS explicitly allows GET. */
   async function download(file: FileOut): Promise<void> {
     try {
       const { url } = await getFileUrl(file.id, true);
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        toastError(new ApiError(resp.status, "download_failed", `Storage answered HTTP ${resp.status}`));
+        return;
+      }
+      const blob = await resp.blob();
       const a = document.createElement("a");
-      a.href = url;
+      a.href = URL.createObjectURL(blob);
+      a.download = file.original_name;
       a.rel = "noopener";
       a.click();
+      // Revoke once the download has definitely started; leaving it around
+      // for a few seconds is harmless, revoking too early can cancel it.
+      window.setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
     } catch (err) {
       toastError(err);
     }
@@ -116,6 +195,20 @@ export function FileGrid({ refreshSignal }: Props): React.JSX.Element {
       toastError(err);
     }
   }
+
+  const groups: FolderGroup[] = useMemo(() => {
+    const byKind = new Map<string, FileOut[]>();
+    for (const f of items) {
+      const k = f.kind ?? "other";
+      const arr = byKind.get(k);
+      if (arr) arr.push(f);
+      else byKind.set(k, [f]);
+    }
+    return FOLDERS.map((folder) => ({
+      ...folder,
+      files: byKind.get(folder.key) ?? [],
+    })).filter((g) => g.files.length > 0);
+  }, [items]);
 
   return (
     <section className="grid-section">
@@ -150,25 +243,47 @@ export function FileGrid({ refreshSignal }: Props): React.JSX.Element {
       {items.length === 0 && !loading ? (
         <div className="grid-empty">No files match. Drop something above.</div>
       ) : (
-        <div className="cards">
-          {items.map((file) => (
-            <Card
-              key={file.id}
-              file={file}
-              onView={() => void view(file)}
-              onDownload={() => void download(file)}
-              onRename={async (name) => {
-                try {
-                  const updated = await renameFile(file.id, name);
-                  setItems((prev) => prev.map((f) => (f.id === file.id ? updated : f)));
-                } catch (err) {
-                  toastError(err);
-                }
-              }}
-              onDelete={() => void remove(file)}
-            />
-          ))}
-        </div>
+        groups.map((g) => {
+          const open = collapsed[g.key] !== false;
+          return (
+            <div className="folder" key={g.key}>
+              <button
+                className="folder-head"
+                onClick={() => toggleFolder(g.key)}
+                aria-expanded={open}
+                title={open ? "Click to collapse" : "Click to expand"}
+              >
+                <span className="folder-icon">{g.icon}</span>
+                <span className="folder-label">{g.label}</span>
+                <span className="folder-count">{g.files.length}</span>
+                <span className={`folder-chevron${open ? "" : " closed"}`}>▾</span>
+              </button>
+              {open && (
+                <div className="cards">
+                  {g.files.map((file) => (
+                    <Card
+                      key={file.id}
+                      file={file}
+                      onView={() => view(file)}
+                      onDownload={() => void download(file)}
+                      onRename={async (name) => {
+                        try {
+                          const updated = await renameFile(file.id, name);
+                          setItems((prev) =>
+                            prev.map((f) => (f.id === file.id ? updated : f)),
+                          );
+                        } catch (err) {
+                          toastError(err);
+                        }
+                      }}
+                      onDelete={() => void remove(file)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })
       )}
 
       {loading && <div className="grid-empty">loading…</div>}
@@ -183,7 +298,7 @@ export function FileGrid({ refreshSignal }: Props): React.JSX.Element {
   );
 }
 
-function Card({
+const Card = memo(function Card({
   file,
   onView,
   onDownload,
@@ -272,4 +387,4 @@ function Card({
       </div>
     </div>
   );
-}
+});

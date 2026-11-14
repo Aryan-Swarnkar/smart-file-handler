@@ -331,6 +331,15 @@ main {
   gap: 12px;
   padding: 10px 6px;
   border-bottom: 1px solid var(--border);
+  /* Uniform height: the slot strip swaps CONTENT between equal-size rows, so
+     completions never resize anything. */
+  min-height: 62px;
+}
+
+/* Empty slot placeholder: keeps the strip's height stable while the queue
+ * drains. Visibility only — never existence. */
+.queue-item.slot-idle {
+  visibility: hidden;
 }
 
 .queue-item:last-child {
@@ -356,6 +365,21 @@ main {
 .qi-meta {
   color: var(--muted);
   font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Counts line under the slot strip: numbers change, height never does. */
+.queue-counts {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 6px 2px;
+  color: var(--muted);
+  font-size: 12px;
+  min-height: 30px;
 }
 
 .queue-item.dedup .qi-meta {
@@ -372,6 +396,12 @@ main {
   border-radius: 2px;
   margin-top: 6px;
   overflow: hidden;
+}
+
+/* Idle = the bar exists but is invisible: the row keeps its height when an
+ * item leaves the uploading state (no more page jumping). */
+.qi-bar.idle {
+  visibility: hidden;
 }
 
 .qi-bar .fill {
@@ -404,11 +434,43 @@ main {
   text-align: center;
 }
 
+/* Bounded-render notices: "+N more waiting" under the capped rows.
+ * `.idle` = same box, invisible + no text overflow — the line never pops
+ * in/out of existence, so the grid below never moves. */
+.queue-more,
+.queue-group-label {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 6px;
+}
+
+.queue-more.idle {
+  visibility: hidden;
+}
+
+.queue-group-label {
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+/* Idle = reserved space, invisible: the label never pops in/out. */
+.queue-group-label.idle {
+  visibility: hidden;
+}
+
 .queue-actions {
   display: flex;
   gap: 10px;
   justify-content: flex-end;
   padding: 8px 6px;
+  /* Reserved height (matches one button row): toggling to idle keeps the
+   * section the same size — nothing below it moves. */
+  min-height: 38px;
+  align-items: center;
+}
+
+.queue-actions.idle {
+  visibility: hidden;
 }
 
 /* --- file grid --------------------------------------------------------------------- */
@@ -438,6 +500,60 @@ main {
   border-radius: 8px;
   padding: 6px 10px;
   font: inherit;
+}
+
+/* --- folders (kind grouping) ---------------------------------------------------------- */
+
+.folder {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.folder-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 9px 14px;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  transition: border-color 0.15s;
+}
+
+.folder-head:hover {
+  border-color: var(--accent);
+}
+
+.folder-icon {
+  font-size: 17px;
+}
+
+.folder-label {
+  font-weight: 600;
+}
+
+.folder-count {
+  color: var(--muted);
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 9px;
+}
+
+.folder-chevron {
+  margin-left: auto;
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+
+.folder-chevron.closed {
+  transform: rotate(-90deg);
 }
 
 .cards {
@@ -549,6 +665,7 @@ main {
   right: 16px;
   display: flex;
   flex-direction: column;
+  align-items: flex-end;
   gap: 8px;
   z-index: 100;
   max-width: 380px;
@@ -586,6 +703,18 @@ main {
 .toast-title {
   font-weight: 600;
   font-size: 13px;
+}
+
+/* Dedupe counter: "×45" badge on a bumped toast row. */
+.toast-count {
+  margin-left: 8px;
+  color: var(--muted);
+  font-weight: 400;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 7px;
+  font-size: 11px;
 }
 
 .toast-countdown {

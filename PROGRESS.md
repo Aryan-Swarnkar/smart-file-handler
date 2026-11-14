@@ -439,3 +439,57 @@ matters); retry-test artifacts leave `processing`/`failed` rows in the dev
 DB (test-only; unique per run, no dedup collisions); worker image not
 verified against a truly cold start of ALL services
 simultaneously (compose health-gating covers the ordering).
+
+## UI bug-fix round — view / shake / folders ✅
+
+User-reported: (1) "cannot view the files after uploading them", (2) "when an
+upload fails the UI shakes up and down", (3) "arrange files in folders like
+documents, images — not a manual filter". Plus "test everything, at least
+twice". Zero backend changes.
+
+Diagnosed live in the automation browser against the USER's own session
+(their 2,036-row queue from a big folder drop was the shake reproducer):
+
+- **View**: `window.open` after an `await` loses transient user activation →
+  popup blocked silently. Fixed: open synchronously in the click handler,
+  navigate after the presigned URL arrives; anchor-click fallback for hard
+  blocks. Verified text/png/docx + fallback path.
+- **Shake**: bounded 5-slot swap-strip queue (content swaps, rows never
+  removed mid-drain; slot count grows, never shrinks until cleared),
+  reserved heights on every conditional element, ~8/s throttled progress,
+  memoized rows, capped failed rows, collapsed finished counts, debounced
+  grid refetch. Measured layout-shift for a 60-file drain: **3.49 → 0.19**.
+- **Toasts**: identical events bump ONE row (×N + timer restart) — a burst
+  of synchronous events must share one authoritative ref (first attempt with
+  a render-mirror produced 5 rows; ref fixed it). request_id stripped from
+  the dedupe key so server rejections dedupe too.
+- **Folders**: kind sections (Images/PDFs/Documents/Text/Other) with live
+  counts, collapsible; filters kept for power use; new-folder appearance on
+  first upload of a kind verified.
+- **Found + fixed while testing**: cancel was swallowed when clicked during
+  `/files/init` (abort listener can't exist before the XHR — post-await
+  `signal.aborted` check now bails with zero PUTs/completes, verified in
+  network log) and was a no-op on unclaimed `waiting` items (direct-mark
+  now); Cancel hidden during `finalizing`; **Download navigated the app tab
+  away** — SeaweedFS ignores the signed `response-content-disposition`
+  override (verified: served `inline`) so Chrome rendered PDFs in place of
+  the SPA; now a blob download with the ORIGINAL filename.
+- **Cleanup**: all ~110 synthetic test files deleted from the account;
+  orphan init row from a canceled upload was swept live by the P4 worker
+  (observed mid-session) — the sweep works on real data.
+
+Verified (2 full passes as required): pass 1 = every interaction live
+(view ×3 kinds + fallback, toasts ×5/×6 bump with byte-identical row
+positions, 60-file drains ×2, cancel-during-init + cancel-waiting, UI
+delete ×2 with the real confirm dialog, rename, filters, folders
+collapse/expand, reload persistence, zero console errors) + backend gates
+(ruff ✓ mypy ✓ (39 files) pytest ✓ 29/29 p3 10/10 p4). Pass 2 = fresh mixed
+drop (png+pdf+txt+bin+dedup twin+oversize+empty) end-to-end with layout-shift
+measurement + all backend gates repeated, all green; `npm run build` clean
+(165.78 KB JS / 53.79 KB gzip).
+
+Known gaps from this round (carried): thumbnail-less cards (P5 will add
+them); the one-time layout shift when NEW files/folders appear in the grid
+on upload completion is real content arrival, not jitter; HMR remounts wipe
+in-memory queue state (dev-only artifact — production builds don't HMR);
+`status` filter still exact-match only.

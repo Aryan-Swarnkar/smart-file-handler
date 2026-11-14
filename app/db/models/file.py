@@ -11,13 +11,11 @@ from sqlalchemy import (
     Index,
     String,
     Text,
-    UniqueConstraint,
 )
 from sqlalchemy import Enum as SQLAlchemyEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, CreatedAtMixin
-from app.db.models.face import FaceInstance
 from app.db.models.label import FileLabel
 
 
@@ -29,8 +27,8 @@ class FileStatus(enum.StrEnum):
 
 
 class FileKind(enum.StrEnum):
-    IMAGE = "image"  # jpg/jpeg/png/webp -> faces + things
-    PDF = "pdf"  # PyMuPDF extraction
+    IMAGE = "image"  # jpg/jpeg/png/webp -> CLIP zero-shot labels (Phase 7)
+    PDF = "pdf"  # PyMuPDF extraction (Phase 7)
     DOCUMENT = "document"  # docx/pptx/xlsx -> office text extraction
     TEXT = "text"  # txt/md/csv -> direct read
     OTHER = "other"  # unprocessable binary: stored, doc_topic="other"
@@ -53,15 +51,10 @@ file_kind_enum = SQLAlchemyEnum(
 class File(Base, CreatedAtMixin):
     __tablename__ = "files"
     __table_args__ = (
-        # Dedup: same user uploading identical bytes reuses this row.
         # Keyset pagination on (user_id, created_at, id): ASC composite serves
         # the DESC scan via PostgreSQL backward index scans, and keeps
         # autogenerate stable (no expression indexes).
         Index("ix_files_user_created_id", "user_id", "created_at", "id"),
-        # Byte-level per-user dedup. sha256 is NULL between init and complete
-        # (NULLs never collide under default NULLS DISTINCT), so two pending
-        # uploads of the same user are fine.
-        UniqueConstraint("user_id", "sha256", name="uq_files_user_id_sha256"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -75,7 +68,7 @@ class File(Base, CreatedAtMixin):
     # BigInteger: Integer overflows at 2 GiB (PG int4).
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # NULL until /complete hashes the real bytes (client-supplied hashes are
-    # never trusted); unique (user_id, sha256) below does the dedup lookup.
+    # never trusted). Integrity check only — v3 has no dedup-by-reuse.
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
 
@@ -92,5 +85,4 @@ class File(Base, CreatedAtMixin):
     doc_topic: Mapped[str | None] = mapped_column(String(50), nullable=True)
     extracted_text_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    faces: Mapped[list[FaceInstance]] = relationship(back_populates="file")
     labels: Mapped[list[FileLabel]] = relationship(back_populates="file")

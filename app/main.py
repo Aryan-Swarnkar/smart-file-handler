@@ -9,8 +9,6 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from arq import create_pool
-from arq.connections import RedisSettings
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -21,7 +19,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import RequestIdMiddleware, configure_logging, get_logger
 from app.db.session import engine
-from app.services.storage import StorageService
+from app.services.storage_service import StorageService
 
 logger = get_logger(__name__)
 
@@ -34,12 +32,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Stateless API: the only "state" we keep is a connection pool, which is
         # required for N replicas behind an LB and is not user-visible state.
+        # No queue connection: the API enqueues nothing to Celery — the outbox
+        # + relay is the only bridge (Phase 6).
         app.state.redis = Redis.from_url(
             settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2
         )
-        # ARQ enqueue pool (same Redis, arq's job schema). Lazy connect — the
-        # API must boot even when Redis is down (readyz reports it).
-        app.state.arq = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
         # Object storage client (S3-compatible: SeaweedFS dev, S3/R2 prod).
         # The bucket is created idempotently here so replicas never depend on
         # an init container.
@@ -50,7 +47,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            await app.state.arq.aclose()
             await app.state.redis.aclose()
             await storage.close()
             await engine.dispose()
@@ -59,7 +55,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="smart-file-handler",
         version="0.1.0",
-        description="Auto-organizes uploaded files into smart categories.",
+        description=(
+            "Drive-style file storage: folders, sharing, automated scan/label pipelines."
+        ),
         lifespan=lifespan,
     )
 

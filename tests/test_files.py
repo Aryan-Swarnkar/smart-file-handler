@@ -1,9 +1,8 @@
-"""P3 files integration tests — real SeaweedFS + real Postgres.
+"""Files integration tests — real SeaweedFS + real Postgres.
 
 Full upload lifecycle per test: init (API) → PUT bytes (httpx → presigned
 SeaweedFS url) → complete (API: HEAD + stream-hash + sniff). Unique emails
-keep users hermetic across runs; unique byte payloads per upload keep dedup
-assertions deterministic.
+keep users hermetic across runs (DB rows persist between runs).
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ from collections.abc import AsyncGenerator
 
 import pytest
 from httpx import AsyncClient, Response
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -145,8 +143,7 @@ async def test_complete_image_kinds(client: AsyncClient, db: AsyncSession) -> No
         body = resp.json()
         assert body["kind"] == "image"
         assert body["mime_type"] == expected_mime
-        assert body["status"] == "uploaded"  # P4 worker will process later
-        assert body["deduplicated"] is False
+        assert body["status"] == "uploaded"  # worker (Phase 6) will process later
         assert body["sha256"] == hashlib.sha256(data).hexdigest()
         assert body["size_bytes"] == len(data)
 
@@ -225,30 +222,7 @@ async def test_complete_is_idempotent(client: AsyncClient) -> None:
     again = await client.post(f"/files/{file_id}/complete", headers=headers)
     assert again.status_code == 200
     assert again.json()["id"] == file_id
-    assert again.json()["deduplicated"] is False
     assert again.json()["sha256"] == first.json()["sha256"]
-
-
-async def test_dedup_returns_existing_row(client: AsyncClient, db: AsyncSession) -> None:
-    headers = await _login(client)
-    # Unique-per-run bytes: DB rows persist across test runs, and the count
-    # query below has no user filter — a fixed payload would also count rows
-    # left by earlier runs. Appended bytes keep the JPEG magic intact.
-    data = JPEG_BYTES + uuid.uuid4().bytes
-    first = await _upload(client, headers, "a.jpg", data)
-    second = await _upload(client, headers, "b.jpg", data)  # same bytes!
-    assert second.status_code == 200, second.text
-    body = second.json()
-    assert body["deduplicated"] is True
-    assert body["id"] == first.json()["id"]  # original row wins
-    assert body["original_name"] == "a.jpg"
-
-    rows = (
-        await db.execute(
-            select(File).where(File.sha256 == hashlib.sha256(data).hexdigest())
-        )
-    ).scalars().all()
-    assert len(rows) == 1  # duplicate row deleted, object never stored twice
 
 
 # --- browse ----------------------------------------------------------------------
@@ -393,7 +367,7 @@ async def test_presigned_urls_use_public_endpoint(monkeypatch: pytest.MonkeyPatc
     The PUT below proves the signature is valid for the public host too.
     """
     from app.core.config import get_settings
-    from app.services.storage import StorageService
+    from app.services.storage_service import StorageService
 
     monkeypatch.setenv("S3_PUBLIC_ENDPOINT_URL", "http://127.0.0.1:9000")
     get_settings.cache_clear()

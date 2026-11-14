@@ -1,13 +1,12 @@
 """FileService: init / complete / list / get / url / rename / delete.
 
-Business rules (user-locked, P3):
+Business rules:
 - Presigned init/complete: bytes go client→S3 directly; the API streams the
   object once at complete to hash + sniff it (25 MB ceiling keeps this cheap).
-- Duplicates: identical bytes for the same user return the EXISTING row and
-  the just-uploaded object is deleted (Google-Photos semantics).
 - Sniff wins: declared mime is advisory; magic bytes decide kind.
 - kind=other → doc_topic="other", status=done immediately (browsable now);
-  processable kinds stay status=uploaded until the worker (P4) claims them.
+  processable kinds stay status=uploaded until the worker claims them
+  (outbox → relay → Celery arrives in Phase 6).
 - Ownership: any foreign/cross-user id → NotFoundError (404, never 403).
 """
 
@@ -18,7 +17,6 @@ import uuid
 from datetime import datetime
 from typing import NamedTuple
 
-from arq.connections import ArqRedis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -32,8 +30,7 @@ from app.services.sniffing import (
     sanitize_filename,
     sniff,
 )
-from app.services.storage import StorageService
-from app.workers.pipeline import PROCESS_JOB_NAME, PROCESS_JOB_PREFIX
+from app.services.storage_service import StorageService
 
 logger = get_logger(__name__)
 
@@ -44,24 +41,11 @@ class InitResult(NamedTuple):
     expires_in: int
 
 
-class CompleteResult(NamedTuple):
-    file: File
-    deduplicated: bool
-
-
 class FileService:
-    def __init__(
-        self,
-        session: AsyncSession,
-        storage: StorageService,
-        queue: ArqRedis | None = None,
-    ) -> None:
+    def __init__(self, session: AsyncSession, storage: StorageService) -> None:
         self._session = session
         self._files = FileRepository(session)
         self._storage = storage
-        # ARQ pool for enqueueing pipeline jobs; None → enqueue silently
-        # skipped (the sweep is the net — that's its whole reason to exist).
-        self._queue = queue
 
     # --- init -----------------------------------------------------------------
 
@@ -96,7 +80,7 @@ class FileService:
 
     # --- complete ---------------------------------------------------------------
 
-    async def complete_upload(self, user_id: uuid.UUID, file_id: uuid.UUID) -> CompleteResult:
+    async def complete_upload(self, user_id: uuid.UUID, file_id: uuid.UUID) -> File:
         file = await self._files.get_by_id(file_id)
         if file is None or file.user_id != user_id:
             raise NotFoundError("File not found.")
@@ -104,7 +88,7 @@ class FileService:
         # Idempotent complete (at-least-once client retries): already hashed
         # means already completed — return the same result again.
         if file.sha256 is not None:
-            return CompleteResult(file, deduplicated=False)
+            return file
 
         meta = await self._storage.head(file.storage_key)
         if meta is None:
@@ -127,20 +111,6 @@ class FileService:
 
         sha256 = await self._hash_object(file.storage_key)
 
-        # --- dedup: same user, identical bytes → keep the ORIGINAL row ------
-        existing = await self._files.get_by_user_and_hash(user_id, sha256)
-        if existing is not None and existing.id != file.id:
-            await self._storage.delete(file.storage_key)  # the duplicate object
-            await self._files.delete(file)
-            await self._session.commit()
-            logger.info(
-                "file_deduplicated",
-                user_id=str(user_id),
-                file_id=str(file.id),
-                kept_id=str(existing.id),
-            )
-            return CompleteResult(existing, deduplicated=True)
-
         file.sha256 = sha256
         file.kind = sniffed.kind
         file.mime_type = sniffed.mime_type
@@ -151,10 +121,8 @@ class FileService:
             file.doc_topic = "other"
             file.status = FileStatus.DONE
         else:
-            file.status = FileStatus.UPLOADED  # P4 queue claims it from here
+            file.status = FileStatus.UPLOADED  # the worker claims it from here (Phase 6)
         await self._session.commit()
-        if sniffed.kind != FileKind.OTHER:
-            await self._enqueue_process(file.id)
         logger.info(
             "file_completed",
             user_id=str(user_id),
@@ -162,31 +130,15 @@ class FileService:
             kind=sniffed.kind.value,
             sha256=sha256[:12],
         )
-        return CompleteResult(file, deduplicated=False)
-
-    async def _enqueue_process(self, file_id: uuid.UUID) -> None:
-        """Best-effort enqueue of the pipeline job (P4: enqueue + sweep).
-
-        Failure MUST NOT fail the request — the row is already committed and
-        `sweep_uploads` re-enqueues unclaimed rows every interval. That is
-        the entire point of having both paths."""
-        if self._queue is None:
-            logger.debug("enqueue_skipped_no_pool", file_id=str(file_id))
-            return
-        try:
-            await self._queue.enqueue_job(
-                PROCESS_JOB_NAME,
-                str(file_id),
-                _job_id=f"{PROCESS_JOB_PREFIX}{file_id}",
-            )
-            logger.info("job_enqueued", file_id=str(file_id))
-        except Exception as exc:
-            logger.warning(
-                "enqueue_failed", file_id=str(file_id), error=str(exc)
-            )
+        return file
 
     async def _hash_object(self, key: str) -> str:
-        """Streaming SHA-256 — constant memory regardless of object size."""
+        """Streaming SHA-256 — constant memory regardless of object size.
+
+        v3 keeps the hash as an upload-integrity check only (declared vs
+        computed is compared in the Phase 7 pipeline); there is no
+        dedup-by-reuse lookup anymore.
+        """
         digest = hashlib.sha256()
         async for chunk in self._storage.read(key):
             digest.update(chunk)

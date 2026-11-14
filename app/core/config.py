@@ -57,9 +57,10 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # --- rate limiting (auth endpoints; per client IP, fixed window) -----------
-    # Namespace isolates key spaces (multi-replica shares Redis; tests get a
-    # unique per-run namespace so rate-limit counters never leak between runs).
+    # --- rate limiting (auth endpoints; per client IP) -------------------------
+    # Fixed-window implementation until Phase 3 swaps in the atomic Redis Lua
+    # token bucket. Namespace isolates key spaces (multi-replica shares Redis;
+    # tests get a unique per-run namespace so counters never leak between runs).
     RATELIMIT_NAMESPACE: str = "rl"
     LOGIN_RATELIMIT_PER_MINUTE: int = 10
     REGISTER_RATELIMIT_PER_MINUTE: int = 5
@@ -89,23 +90,22 @@ class Settings(BaseSettings):
     # --- uploads ---------------------------------------------------------------
     MAX_UPLOAD_MB: int = 25
 
-    # --- queue / worker (P4) -----------------------------------------------------
-    # The API enqueues a job right after complete commits; the worker-side sweep
-    # is the crash-recovery net (API died mid-enqueue, Redis was down, or the
-    # enqueue failed). Orphan init rows (bytes never PUT, presigned URL long
-    # expired) are deleted by the same sweep after a grace window.
-    SWEEP_INTERVAL_SECONDS: int = 30
-    ORPHAN_INIT_MINUTES: int = 60
-    WORKER_MAX_TRIES: int = 3
-    WORKER_RETRY_BASE_SECONDS: int = 5
-    WORKER_RETRY_MAX_SECONDS: int = 300
+    # --- quotas (fields land on users in Phase 2; knob used at registration) ---
+    DEFAULT_STORAGE_QUOTA_GB: int = 5
+
+    # --- ClamAV (scan pipeline, Phase 7) -----------------------------------------
+    CLAMAV_HOST: str = "localhost"
+    CLAMAV_PORT: int = 3310
+
+    # --- ML pipeline (Phase 7) -----------------------------------------------
+    # ML_STUB=1: workers use fixed-delay fakes returning deterministic labels
+    # instead of real models. Real models only on explicit ask, never alongside
+    # the full stack + Locust (16 GB host).
+    ML_STUB: bool = True
 
     # --- HTTP -------------------------------------------------------------------
     # Comma-separated origins; empty string disables CORS middleware.
     CORS_ORIGINS: str = ""
-
-    # --- observability ------------------------------------------------------------
-    SENTRY_DSN: str | None = None
 
     @property
     def is_production(self) -> bool:

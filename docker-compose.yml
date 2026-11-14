@@ -1,6 +1,9 @@
 services:
   postgres:
-    # pgvector build of PG16 — required for face embedding columns (P1).
+    # Phase 1 keeps the pgvector build: the CURRENT dev volume still contains
+    # vector columns and the extension .so lives in the image, not the data
+    # dir — plain postgres:16-alpine would break on those tables until the
+    # Phase 2 wipe. Image swap lands WITH the wipe.
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
@@ -16,6 +19,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    mem_limit: 512m
 
   redis:
     image: redis:7-alpine
@@ -30,12 +34,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    mem_limit: 256m
 
   s3:
-    # SeaweedFS stands in for MinIO: MinIO community edition was discontinued
-    # (images/binaries gone from Docker Hub, quay.io and dl.min.io; repo
-    # archived). User-approved substitution. Production uses S3/R2 via
-    # aioboto3; only this dev container differs. S3 API on 8333, master UI 9333.
+    # SeaweedFS stands in for MinIO — verified 2026-11-14 that the MinIO
+    # community edition is discontinued (minio/minio: 404 on Docker Hub;
+    # dl.min.io releases: HTTP 410). User-approved substitution. Production
+    # uses S3/R2 via aioboto3; only this dev container differs.
+    # S3 API on 8333, master UI 9333.
     image: chrislusf/seaweedfs:3.99
     restart: unless-stopped
     command:
@@ -56,6 +62,22 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    mem_limit: 512m
+
+  clamav:
+    # ClamAV clamd (scan pipeline, Phase 7). GPL-2.0 engine in a separately-run
+    # container (license-flagged in MIGRATION_PLAN.md §7). No host port: only
+    # api/worker talk to clamd, inside the compose network. First boot
+    # downloads the signature DB (~250 MB) — generous start_period.
+    image: clamav/clamav:latest
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "clamdcheck.sh || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 300s
+    mem_limit: 2g
 
   api:
     build:
@@ -82,7 +104,20 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
-      SENTRY_DSN: ${SENTRY_DSN:-}
+    mem_limit: 512m
+    # Healthcheck: python is in the image (curl is not).
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,9 +127,9 @@ services:
         condition: service_healthy
 
   worker:
-    # ARQ worker (P4): pipeline jobs + crash-recovery sweep. Same image, the
-    # Dockerfile's `worker` target. Shares redis db 0 with the API: the API
-    # enqueues, the worker consumes + sweeps unclaimed rows.
+    # Phase 1 placeholder: boots and stays up so compose health is testable.
+    # Celery tasks land in Phase 6, scan/label pipelines in Phase 7. Same
+    # image, the Dockerfile's `worker` target.
     build:
       context: .
       target: worker
@@ -112,15 +147,38 @@ services:
       S3_BUCKET: ${S3_BUCKET:-smart-file-handler}
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
-      SWEEP_INTERVAL_SECONDS: ${SWEEP_INTERVAL_SECONDS:-30}
-      ORPHAN_INIT_MINUTES: ${ORPHAN_INIT_MINUTES:-60}
-      WORKER_MAX_TRIES: ${WORKER_MAX_TRIES:-3}
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      ML_STUB: ${ML_STUB:-1}
+    mem_limit: 512m
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       s3:
+        condition: service_healthy
+      clamav:
+        condition: service_started
+
+  relay:
+    # Outbox -> Celery relay (Phase 6). Placeholder until then: the container
+    # must exist and stay up so compose health is testable.
+    build:
+      context: .
+      target: worker
+    restart: unless-stopped
+    environment:
+      ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-smart_file_handler}
+      REDIS_URL: redis://redis:6379/0
+    mem_limit: 256m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:

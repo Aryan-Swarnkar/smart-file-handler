@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Annotated
 
-from arq.connections import ArqRedis
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
@@ -16,10 +15,10 @@ from app.core.errors import RateLimitedError, UnauthorizedError
 from app.db.models import User
 from app.db.session import get_session
 from app.services.auth import AuthService
-from app.services.files import FileService
+from app.services.file_service import FileService
 from app.services.rate_limit import RateLimiter
 from app.services.security import decode_access_token
-from app.services.storage import StorageService
+from app.services.storage_service import StorageService
 
 # auto_error=False: a missing Authorization header should raise OUR envelope
 # (401 unauthorized), not FastAPI's default 403 "Not authenticated".
@@ -102,19 +101,13 @@ def get_storage(request: Request) -> StorageService:
     return storage
 
 
-def get_arq(request: Request) -> ArqRedis:
-    pool: ArqRedis | None = getattr(request.app.state, "arq", None)
-    if pool is None:  # lifespan never ran — fail loudly, not mysteriously
-        raise RuntimeError("ARQ pool not initialized; lifespan did not run.")
-    return pool
-
-
 def files_service(
     session: Annotated[AsyncSession, Depends(get_session)],
     storage: Annotated[StorageService, Depends(get_storage)],
-    arq_pool: Annotated[ArqRedis, Depends(get_arq)],
 ) -> FileService:
-    return FileService(session, storage, arq_pool)
+    # Stateless API: no queue connection — the outbox + relay is the only
+    # bridge to Celery (Phase 6); the API enqueues nothing.
+    return FileService(session, storage)
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]

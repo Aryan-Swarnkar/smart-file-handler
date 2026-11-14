@@ -14,7 +14,6 @@ from fastapi import APIRouter, Query, Response, status
 
 from app.api.deps import CurrentUser, FilesService
 from app.schemas.files import (
-    FileCompleteOut,
     FileInitIn,
     FileInitOut,
     FileOut,
@@ -47,21 +46,16 @@ async def init_upload(
 
 @router.post(
     "/{file_id}/complete",
-    response_model=FileCompleteOut,
+    response_model=FileOut,
     summary="Step 2: verify + hash + sniff the uploaded bytes",
 )
 async def complete_upload(
     file_id: uuid.UUID,
     user: CurrentUser,
     service: FilesService,
-) -> FileCompleteOut:
-    result = await service.complete_upload(user.id, file_id)
-    # Build explicitly: the ORM File has no `deduplicated` attribute, so
-    # model_validate on it would 500. FileOut carries the from_attributes.
-    return FileCompleteOut(
-        **FileOut.model_validate(result.file, from_attributes=True).model_dump(),
-        deduplicated=result.deduplicated,
-    )
+) -> FileOut:
+    file = await service.complete_upload(user.id, file_id)
+    return FileOut.model_validate(file, from_attributes=True)
 
 
 @router.get("", response_model=FilePageOut, summary="All Files (keyset pagination)")

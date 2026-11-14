@@ -14,7 +14,8 @@ FROM base AS builder
 COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 # --frozen: refuse if lock is out of sync with pyproject (CI safety).
-RUN uv sync --frozen --no-dev --no-install-project
+# UV_HTTP_TIMEOUT: default 30s botches 13 MB wheels on slow networks.
+RUN UV_HTTP_TIMEOUT=120 uv sync --frozen --no-dev --no-install-project
 
 FROM base AS runtime-common
 COPY --from=builder /app/.venv /app/.venv
@@ -29,5 +30,6 @@ EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 FROM runtime-common AS worker
-# Wired up in Phase 4 when app.workers lands; harmless until compose runs it.
-CMD ["arq", "app.workers.settings.WorkerSettings"]
+# Placeholder until the Celery worker lands (Phase 6): the container must boot
+# and stay up so compose health is testable in Phase 1.
+CMD ["python", "-c", "import time; print('worker placeholder (Celery arrives Phase 6)'); time.sleep(2**31)"]

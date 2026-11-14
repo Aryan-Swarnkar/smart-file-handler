@@ -11,9 +11,9 @@ from __future__ import annotations
 import base64
 import uuid
 from datetime import datetime
-from typing import Any, NamedTuple, cast
+from typing import NamedTuple
 
-from sqlalchemy import CursorResult, delete, select, tuple_
+from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import File, FileKind, FileStatus
@@ -67,14 +67,6 @@ class FileRepository:
     async def get_by_id(self, file_id: uuid.UUID) -> File | None:
         return await self._session.get(File, file_id)
 
-    async def get_by_user_and_hash(
-        self, user_id: uuid.UUID, sha256: str
-    ) -> File | None:
-        result = await self._session.execute(
-            select(File).where(File.user_id == user_id, File.sha256 == sha256)
-        )
-        return result.scalar_one_or_none()
-
     async def list_page(
         self,
         *,
@@ -114,39 +106,3 @@ class FileRepository:
     async def delete(self, file: File) -> None:
         await self._session.delete(file)
         await self._session.flush()
-
-    # --- worker support (P4) -----------------------------------------------------
-
-    async def list_enqueue_candidates(self, *, limit: int = 500) -> list[File]:
-        """Completed-but-never-claimed rows — the sweep's enqueue set.
-
-        `sha256 IS NOT NULL` means complete() ran and committed a processable
-        file that no worker has claimed yet (still status=uploaded). Init rows
-        (sha256 still NULL) are NOT here: their bytes were never PUT, so there
-        is nothing to process.
-        """
-        stmt = (
-            select(File)
-            .where(File.status == FileStatus.UPLOADED, File.sha256.is_not(None))
-            .order_by(File.created_at)
-            .limit(limit)
-        )
-        return list((await self._session.execute(stmt)).scalars().all())
-
-    async def delete_orphan_inits(self, *, older_than: datetime) -> int:
-        """Delete init rows whose presigned URL window has long passed with no
-        bytes ever PUT (sha256 still NULL) — they can never complete. The S3
-        side needs no cleanup: without a PUT there is no object.
-
-        Returns the number of rows removed (committed by the caller)."""
-        stmt = delete(File).where(
-            File.sha256.is_(None),
-            File.created_at < older_than,
-        )
-        # rowcount lives on CursorResult (DML); asyncpg returns one for
-        # DELETE, but the static type is the generic Result.
-        result = cast(
-            "CursorResult[Any]",
-            await self._session.execute(stmt),
-        )
-        return int(result.rowcount)

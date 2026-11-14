@@ -1,9 +1,9 @@
 [project]
 name = "smart-file-handler"
 version = "0.1.0"
-description = "Async backend that auto-organizes uploads into smart categories: faces, things, document topics."
+description = "Async Drive-style file backend: folders, sharing, quotas, automated scan/label pipelines."
 readme = "README.md"
-# Pinned to the 3.12 line: torch/insightface/onnxruntime wheels are only guaranteed for it.
+# Pinned to the 3.12 line: ML wheels (torch etc., Phase 7) are only guaranteed for it.
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # --- web layer (P0) ---
@@ -18,10 +18,8 @@ dependencies = [
     "asyncpg>=0.30",
     "greenlet>=3.1",
     "alembic>=1.13",
-    "pgvector>=0.3",
-    # --- queue/cache (P1/P4) ---
+    # --- cache (rate limiting; Celery broker arrives Phase 6) ---
     "redis>=5.1",
-    "arq>=0.26",
     # --- object storage (P3) ---
     "aioboto3>=13.2",
     # --- security (P2) ---
@@ -44,6 +42,9 @@ dev = [
 [tool.uv]
 # Application repo, not an installable package: `uv sync` only installs deps.
 package = false
+# Repo lives under OneDrive: hardlinked files break the cloud sync
+# (os error 396 "incompatible hardlinks"). Copy mode keeps the venv syncable.
+link-mode = "copy"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

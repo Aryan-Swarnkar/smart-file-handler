@@ -39,10 +39,6 @@ class FileOut(BaseModel):
     created_at: datetime
 
 
-class FileCompleteOut(FileOut):
-    deduplicated: bool
-
-
 class FileRenameIn(BaseModel):
     original_name: str = Field(min_length=1, max_length=255)
 

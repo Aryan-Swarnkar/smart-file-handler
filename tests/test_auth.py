@@ -11,11 +11,12 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from argon2 import PasswordHasher
 from httpx import AsyncClient, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -407,6 +408,47 @@ async def test_refresh_unknown_token_401(client: AsyncClient) -> None:
     resp = await client.post("/auth/refresh", json={"refresh_token": "no-such-token"})
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "invalid_refresh_token"
+
+
+async def test_refresh_expired_token_401_and_revoked(
+    client: AsyncClient, db: AsyncSession
+) -> None:
+    """An EXPIRED (not reused) refresh token: 401 and that row is revoked.
+
+    Expiry is natural, not a theft signal — only the expired row dies, no
+    family nuke (a family nuke here would log out other devices on every
+    natural expiry).
+    """
+    email = _email()
+    await _register(client, email)
+    login = (await _login(client, email)).json()
+    token_hash = hash_refresh_token(login["refresh_token"])
+
+    # Age the stored token past expiry, DB-side (the API had nothing to do
+    # with it — same state a token reaches after 7 real days).
+    await db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.token_hash == token_hash)
+        .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
+    )
+    await db.commit()
+
+    resp = await client.post(
+        "/auth/refresh", json={"refresh_token": login["refresh_token"]}
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_refresh_token"
+
+    # Column-level SELECT: bypasses the identity map (this session already
+    # cached the entity object, which would mask the service's UPDATE).
+    revoked = (
+        await db.execute(
+            select(RefreshToken.revoked_at).where(
+                RefreshToken.token_hash == token_hash
+            )
+        )
+    ).scalar_one()
+    assert revoked is not None
 
 
 # --- logout ---------------------------------------------------------------------

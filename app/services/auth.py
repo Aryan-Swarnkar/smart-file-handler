@@ -67,7 +67,11 @@ class AuthService:
         if existing is not None:
             raise ConflictError("This email is already registered.", code="email_taken")
         try:
-            user = await self._users.create(email, hash_password(password))
+            user = await self._users.create(
+                email,
+                hash_password(password),
+                storage_quota_bytes=get_settings().default_storage_quota_bytes,
+            )
             await self._session.commit()
         except IntegrityError:
             # Lost a race against a concurrent register (unique index fired):

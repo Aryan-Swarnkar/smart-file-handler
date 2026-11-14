@@ -1,10 +1,8 @@
 services:
   postgres:
-    # Phase 1 keeps the pgvector build: the CURRENT dev volume still contains
-    # vector columns and the extension .so lives in the image, not the data
-    # dir — plain postgres:16-alpine would break on those tables until the
-    # Phase 2 wipe. Image swap lands WITH the wipe.
-    image: pgvector/pgvector:pg16
+    # v3 (Phase 2): plain postgres:16-alpine. pgvector is CUT; pg_trgm and
+    # citext are in contrib and created by the initial migration.
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-smart_file_handler}

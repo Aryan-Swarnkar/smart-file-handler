@@ -21,8 +21,20 @@ class UserRepository:
     async def get_by_id(self, user_id: uuid.UUID) -> User | None:
         return await self._session.get(User, user_id)
 
-    async def create(self, email: str, password_hash: str) -> User:
-        user = User(email=email, password_hash=password_hash)
+    async def create(
+        self,
+        email: str,
+        password_hash: str,
+        *,
+        storage_quota_bytes: int,
+    ) -> User:
+        user = User(
+            email=email,
+            password_hash=password_hash,
+            # Explicit (not the 5 GiB server default) so the
+            # DEFAULT_STORAGE_QUOTA_GB env knob applies to new accounts.
+            storage_quota_bytes=storage_quota_bytes,
+        )
         self._session.add(user)
         # flush (not commit): the service owns the transaction boundary and
         # commits once per operation; flush assigns id/created_at for callers.

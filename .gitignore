@@ -27,3 +27,6 @@ storage/
 web/node_modules/
 web/dist/
 web/.vite/
+
+# Phase 2 wipe safety artifacts (pg_dump + preserved auth rows) — local only
+backups/

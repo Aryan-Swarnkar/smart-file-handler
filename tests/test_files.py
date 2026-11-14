@@ -148,32 +148,34 @@ async def test_complete_image_kinds(client: AsyncClient, db: AsyncSession) -> No
         assert body["size_bytes"] == len(data)
 
 
-async def test_complete_pdf_and_office(client: AsyncClient) -> None:
+async def test_complete_pdf_and_zip_is_other(client: AsyncClient) -> None:
     headers = await _login(client)
     pdf = await _upload(client, headers, "report.pdf", PDF_BYTES)
     assert pdf.status_code == 200
     assert pdf.json()["kind"] == "pdf"
     assert pdf.json()["mime_type"] == "application/pdf"
 
+    # v3 allowlist has no office kinds: ZIP magic (docx) classifies as other,
+    # with the single generic fallback mime (no per-kind special-casing).
     docx = await _upload(client, headers, "notes.docx", DOCX_BYTES)
     assert docx.status_code == 200, docx.text
-    assert docx.json()["kind"] == "document"
-    assert (
-        docx.json()["mime_type"]
-        == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
+    assert docx.json()["kind"] == "other"
+    assert docx.json()["mime_type"] == "application/octet-stream"
 
 
-async def test_complete_text_kinds(client: AsyncClient) -> None:
+async def test_complete_non_allowlist_kinds_are_other(client: AsyncClient) -> None:
+    """txt/csv have no magic and no pipeline in v3: kind=other → done, browsable."""
     headers = await _login(client)
     txt = await _upload(client, headers, "readme.txt", TXT_BYTES)
     assert txt.status_code == 200
-    assert txt.json()["kind"] == "text"
-    assert txt.json()["mime_type"] == "text/plain"
+    assert txt.json()["kind"] == "other"
+    assert txt.json()["mime_type"] == "application/octet-stream"
+    assert txt.json()["status"] == "done"
+    assert txt.json()["doc_topic"] == "other"
 
     csv = await _upload(client, headers, "data.csv", CSV_BYTES)
-    assert csv.json()["kind"] == "text"
-    assert csv.json()["mime_type"] == "text/csv"
+    assert csv.json()["kind"] == "other"
+    assert csv.json()["status"] == "done"
 
 
 async def test_complete_other_binary_is_done_and_browsable(

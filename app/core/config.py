@@ -90,8 +90,12 @@ class Settings(BaseSettings):
     # --- uploads ---------------------------------------------------------------
     MAX_UPLOAD_MB: int = 25
 
-    # --- quotas (fields land on users in Phase 2; knob used at registration) ---
+    # --- quotas (Phase 5 enforces; set at registration from this knob) --------
     DEFAULT_STORAGE_QUOTA_GB: int = 5
+
+    @property
+    def default_storage_quota_bytes(self) -> int:
+        return self.DEFAULT_STORAGE_QUOTA_GB * 1024 * 1024 * 1024
 
     # --- ClamAV (scan pipeline, Phase 7) -----------------------------------------
     CLAMAV_HOST: str = "localhost"

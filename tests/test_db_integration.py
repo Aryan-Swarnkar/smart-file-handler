@@ -51,13 +51,13 @@ async def test_enum_values_persist(db: AsyncSession) -> None:
     await db.flush()
     f = File(
         user_id=user.id,
-        original_name="t.txt",
-        mime_type="text/plain",
+        original_name="t.pdf",
+        mime_type="application/pdf",
         size_bytes=3,
         sha256="1" * 64,
-        storage_key=f"{user.id}/t.txt",
+        storage_key=f"{user.id}/t.pdf",
         status=FileStatus.DONE,
-        kind=FileKind.TEXT,
+        kind=FileKind.PDF,
         doc_topic="other",
     )
     db.add(f)
@@ -67,5 +67,5 @@ async def test_enum_values_persist(db: AsyncSession) -> None:
     )
     status, kind, topic = row.one()
     assert status == FileStatus.DONE
-    assert kind == FileKind.TEXT
+    assert kind == FileKind.PDF
     assert topic == "other"

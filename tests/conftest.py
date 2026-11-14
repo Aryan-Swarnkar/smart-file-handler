@@ -20,7 +20,9 @@ os.environ.setdefault(
 # P2: auth tests need a REAL redis (rate limiting) — compose redis on 6379.
 # A unique namespace per run keeps rate-limit counters from leaking between
 # pytest runs (Redis data outlives the test process).
-os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+# P4: db 15 (not the dev stack's db 0) so a RUNNING dev worker can never
+# consume the tests' enqueued jobs and race the direct-call worker tests.
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
 os.environ.setdefault(
     "RATELIMIT_NAMESPACE", f"rl-test-{os.urandom(4).hex()}"
 )

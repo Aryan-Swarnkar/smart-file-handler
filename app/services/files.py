@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime
 from typing import NamedTuple
 
+from arq.connections import ArqRedis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -32,6 +33,7 @@ from app.services.sniffing import (
     sniff,
 )
 from app.services.storage import StorageService
+from app.workers.pipeline import PROCESS_JOB_NAME, PROCESS_JOB_PREFIX
 
 logger = get_logger(__name__)
 
@@ -48,10 +50,18 @@ class CompleteResult(NamedTuple):
 
 
 class FileService:
-    def __init__(self, session: AsyncSession, storage: StorageService) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        storage: StorageService,
+        queue: ArqRedis | None = None,
+    ) -> None:
         self._session = session
         self._files = FileRepository(session)
         self._storage = storage
+        # ARQ pool for enqueueing pipeline jobs; None → enqueue silently
+        # skipped (the sweep is the net — that's its whole reason to exist).
+        self._queue = queue
 
     # --- init -----------------------------------------------------------------
 
@@ -143,6 +153,8 @@ class FileService:
         else:
             file.status = FileStatus.UPLOADED  # P4 queue claims it from here
         await self._session.commit()
+        if sniffed.kind != FileKind.OTHER:
+            await self._enqueue_process(file.id)
         logger.info(
             "file_completed",
             user_id=str(user_id),
@@ -151,6 +163,27 @@ class FileService:
             sha256=sha256[:12],
         )
         return CompleteResult(file, deduplicated=False)
+
+    async def _enqueue_process(self, file_id: uuid.UUID) -> None:
+        """Best-effort enqueue of the pipeline job (P4: enqueue + sweep).
+
+        Failure MUST NOT fail the request — the row is already committed and
+        `sweep_uploads` re-enqueues unclaimed rows every interval. That is
+        the entire point of having both paths."""
+        if self._queue is None:
+            logger.debug("enqueue_skipped_no_pool", file_id=str(file_id))
+            return
+        try:
+            await self._queue.enqueue_job(
+                PROCESS_JOB_NAME,
+                str(file_id),
+                _job_id=f"{PROCESS_JOB_PREFIX}{file_id}",
+            )
+            logger.info("job_enqueued", file_id=str(file_id))
+        except Exception as exc:
+            logger.warning(
+                "enqueue_failed", file_id=str(file_id), error=str(exc)
+            )
 
     async def _hash_object(self, key: str) -> str:
         """Streaming SHA-256 — constant memory regardless of object size."""

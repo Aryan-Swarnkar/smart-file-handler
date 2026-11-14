@@ -10,7 +10,7 @@ Reading order convention:
 
 ---
 
-## System map (current: after Phase 3.5)
+## System map (current: after Phase 4)
 
 ```
 web/ React UI (Vite :5173) ──▶ API (uvicorn, FastAPI) ──▶ structlog JSON logs
@@ -25,7 +25,7 @@ web/ React UI (Vite :5173) ──▶ API (uvicorn, FastAPI) ──▶ structlog 
                        └─▶ /readyz polled every 15s by web/src/components/StatusStrip.tsx
 ```
 
-## File responsibility map (current: after Phase 3.5)
+## File responsibility map (current: after Phase 4)
 
 | File | Owns | Used by |
 |---|---|---|
@@ -40,10 +40,12 @@ web/ React UI (Vite :5173) ──▶ API (uvicorn, FastAPI) ──▶ structlog 
 | `app/schemas/files.py` | `FileInitIn/Out`, `FileOut`, `FileCompleteOut(+deduplicated)`, `FileRenameIn`, `FileUrlOut`, `FilePageOut` | files router |
 | `app/repositories/users.py` | All `users` table queries | AuthService |
 | `app/repositories/refresh_tokens.py` | Token lookup by hash, create, revoke, family nuke | AuthService |
-| `app/repositories/files.py` | All `files` queries + **keyset cursor encode/decode** + `Page` | FileService |
+| `app/repositories/files.py` | All `files` queries + **keyset cursor encode/decode** + `Page` + **P4 sweep queries** (enqueue candidates = uploaded + sha256 set; delete orphan inits) | FileService, worker jobs |
 | `app/services/security.py` | argon2 hash/verify + dummy-verify, JWT create/decode, refresh token material (SHA-256 only stored) | AuthService, deps |
 | `app/services/auth.py` | register/login/refresh(rotation+reuse)/logout business rules; one commit per operation | deps |
-| `app/services/files.py` | **init/complete/list/get/url/rename/delete business rules**: size limit, HEAD→sniff→sha256→dedup→commit, S3-before-DB delete ordering | deps |
+| `app/services/files.py` | **init/complete/list/get/url/rename/delete business rules**: size limit, HEAD→sniff→sha256→dedup→commit, S3-before-DB delete ordering, **P4: best-effort ARQ enqueue after a processable commit** | deps |
+| `app/workers/pipeline.py` | **P4 job coroutines (the worker's service layer)**: `process_file` (claim uploaded→processing→pipeline seam→done; idempotent claim guard; Retry with exponential backoff; terminal failure → status=failed + error), `sweep_uploads` (enqueue unclaimed completed rows + delete stale orphan inits) | WorkerSettings |
+| `app/workers/settings.py` | ARQ `WorkerSettings` (`arq app.workers.settings.WorkerSettings`): functions + cron sweep (quantized to the minute grid), startup/shutdown mirroring the API lifespan (session factory + StorageService into ctx), `max_tries`, redis settings from `REDIS_URL` | worker Docker target |
 | `app/services/sniffing.py` | **Pure byte classifier**: magic JPEG/PNG/WEBP/PDF/ZIP, office-ext disambiguation, UTF-8 text probe; filename sanitizers | FileService |
 | `app/services/storage.py` | **The only S3 client**: aioboto3 SigV4, presign put/get (public endpoint), head/read/delete, bucket + CORS bootstrap | FileService, readyz |
 | `app/services/rate_limit.py` | Redis fixed-window limiter (INCR+EXPIRE), fail-open policy | deps |
@@ -59,7 +61,9 @@ web/ React UI (Vite :5173) ──▶ API (uvicorn, FastAPI) ──▶ structlog 
 | `tests/test_db_integration.py` | pgvector roundtrip + cosine NN + enum persistence (rollback-isolated) | pytest |
 | `tests/test_auth.py` | 18 auth integration tests (register/login/refresh/logout/429) | pytest |
 | `tests/test_files.py` | 19 files integration tests (real SeaweedFS PUT/GET: kinds, sniff-wins, dedup, 409/422, pagination, 404 matrix, rename/delete, **presign public endpoint**) | pytest |
+| `tests/test_worker.py` | 9 worker tests (real DB + Redis db 15): claim/done, skip-when-done, missing/incomplete guards, Retry backoff + terminal failed, sweep enqueue/idempotency/orphan-init deletion, API complete→queue | pytest |
 | `scripts/p3_live_check.ps1` | 29-check live walkthrough of every files route + readyz + CORS preflight | manual verification |
+| `scripts/p4_live_check.ps1` | 10-check live walkthrough of the queue: complete→worker-processed=done, Matrix A no-queue, dedup, filters, cleanup | manual verification |
 | `web/src/types.ts` | TS mirrors of `app/schemas/{auth,files}.py` + `ApiErrorBody` envelope + `ReadyBody`; `fmtBytes`/`fmtDate` helpers | every web module (kept in sync manually) |
 | `web/src/api/session.ts` | Token store on localStorage (`sfh.access`/`sfh.refresh`) + tiny listener registry so the fetch client can wipe a dead session | client, AuthContext |
 | `web/src/api/client.ts` | Fetch wrapper: `API_URL` (from `VITE_API_URL`), bearer header, envelope→`ApiError`, **single-flight 401→refresh→replay** (`_retried` bound, refresh rotates single-use tokens so parallel 401s share ONE refresh) | all web api modules |
@@ -435,6 +439,7 @@ cursors.
 | redis | `redis:7-alpine` | 6379 | AOF persistence on |
 | s3 | `chrislusf/seaweedfs:3.99` | 9000→8333, 9333 | S3 API + master UI; creds from `deploy/seaweedfs/s3.json` |
 | api | built (`target: api`) | 8000 | env overrides `.env` (env vars beat dotenv in pydantic-settings); `S3_ENDPOINT_URL=s3:8333` (internal) + `S3_PUBLIC_ENDPOINT_URL=localhost:9000` (handed-out presigned URLs) |
+| worker | built (`target: worker`) | — | P4: ARQ pipeline + sweep; shares redis db 0 with the api; `restart: unless-stopped` |
 
 `depends_on` uses `service_healthy` conditions, not just "started".
 
@@ -497,7 +502,67 @@ adds the attachment disposition). Rename = double-click → inline form →
 dot per dependency + "all up"/"degraded"/"API unreachable". `Toaster` renders
 429s with a live countdown built from `details.retry_after_seconds`.
 
-## Technologies in play (through Phase 3.5)
+## Workflow 12 — Queue + worker (Phase 4)
+
+**Design (user-locked: enqueue + sweep, full skeleton, 3 tries / exp backoff):**
+
+```
+complete_upload (processable kind)
+   └─ commit (status=uploaded) ─▶ enqueue_job("process_file", id, _job_id="process:{id}")
+                                   │ best-effort: Redis down → log only
+worker cron (every 30s)          ▼
+   sweep_uploads ──▶ status=uploaded + sha256 NOT NULL ─▶ enqueue (same job_id → arq dedups)
+                 ──▶ sha256 NULL + created_at < 60min ago ─▶ DELETE row (orphan init)
+process_file:
+   uploaded ─claim─▶ processing ──▶ _run_pipeline() ──▶ done
+                          │        (P4: no-op seam; P5/P6 replace body only)
+                          └─ raise ─▶ attempt < 3: Retry(defer=5·2^(n-1) capped 300)
+                                    attempt = 3: status=failed + error text (browsable)
+```
+
+**Click → code path** (worker side):
+
+1. `POST /files/{id}/complete` commits the processable row →
+   `FileService._enqueue_process` (`app/services/files.py`) enqueues with the
+   canonical job id `process:{file_id}` — arq collapses duplicates by job_id
+   while the job exists. Enqueue failure is swallowed BY DESIGN: the row is
+   already committed and the sweep re-enqueues it within 30s.
+2. The worker (`arq app.workers.settings.WorkerSettings`, compose `worker`
+   target) pops the job → `process_file` (`app/workers/pipeline.py`):
+   - row missing → log + return (user deleted during a backoff window);
+   - sha256 NULL → never claim (defensive — the sweep also excludes these);
+   - `status=done|failed` → return "skipped" (idempotency guard: retries and
+     duplicate enqueues never re-process);
+   - `status=uploaded` → claim: `processing`, commit (crash-safe: a dead
+     worker's in-flight job is re-run by arq's `retry_jobs` on startup, and
+     re-entry into a claimed file is safe — the seam is idempotent);
+   - `_run_pipeline(file)` — **the P5/P6 seam** (P4 body: no-op; doc_topic
+     stays NULL for processable kinds until P6 assigns real topics);
+   - exception: `ctx["job_try"] < WORKER_MAX_TRIES` → `Retry(defer=5·2^(n-1))`
+     (5s, 10s, 20s … capped 300s); else terminal → `status=failed` +
+     `error[:500]` (the UI shows the failed chip).
+3. `sweep_uploads` (cron `second={0,30}`, `run_at_startup`, `unique`,
+   `max_tries=1`): enqueue candidates (uploaded + sha256 set) with the same
+   job_id → already-queued jobs dedup; orphan inits (sha256 NULL older than
+   `ORPHAN_INIT_MINUTES`) deleted — no S3 cleanup needed (no PUT, no object).
+
+**Why two trigger paths**: the enqueue gives instant processing in the happy
+path; the sweep closes the gap where the API died between its DB commit and
+its Redis enqueue (or Redis was down — the limiter is fail-open, the queue
+cannot be). Together: no completed file ever waits longer than one sweep.
+
+**Redis isolation**: API enqueues on `REDIS_URL` (compose: db 0); conftest
+forces **db 15** for tests so a running dev worker can never consume jobs the
+tests enqueue, and direct-call worker tests can assert queue state without a
+live worker racing them.
+
+**Technologies**: arq 0.28 (Redis asyncio job queue; sorted-set queue, job
+hashes, `retry_jobs=True` startup re-queue for dead-worker recovery),
+SQLAlchemy `delete()` + rowcount for the orphan sweep, structlog JSON in the
+worker process (same configure_logging as the API — every worker line is
+JSON with request_id="-").
+
+## Technologies in play (through Phase 4)
 
 - **FastAPI** (ASGI) + **uvicorn** — HTTP layer, fully async handlers.
 - **pydantic-settings v2** — `Settings`; env vars > `.env` > code defaults;
@@ -521,6 +586,9 @@ dot per dependency + "all up"/"degraded"/"API unreachable". `Toaster` renders
   presigned PUT/GET URLs, HeadObject/GetObject streaming, DeleteObject,
   HeadBucket readiness, PutBucketCors bootstrap. Dual-endpoint design
   (internal client vs public presigner) keeps container networking honest.
+- **arq 0.28** — Redis-backed asyncio job queue: enqueue-on-complete +
+  cron sweep (crash recovery), per-job idempotency via `_job_id`, `Retry`
+  exponential backoff, `retry_jobs=True` for dead-worker startup recovery.
 - **uv** — locked, cached dependency installs (host + Docker builder).
 - **Docker Compose** — 4-service local stack with health-gated startup.
 - **React 18 + Vite 5 + TypeScript 5.6 (strict)** — `web/` testing UI; zero

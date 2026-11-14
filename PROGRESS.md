@@ -19,6 +19,7 @@ Running log of phases, verification evidence, and known gaps. Updated after ever
 | 11 | **P3 upload design (9 decisions via Q&A)**: presigned init/complete (bytes bypass API); duplicate → EXISTING row + `deduplicated: true` + duplicate object deleted; hard delete (row + S3 object); thumbnails deferred to P5; P3 browse = filters only; **sniff wins** (fake .jpg → other); office = ZIP magic + extension; PATCH rename; 20/page max 100, newest-first, opaque base64 cursor. |
 | 12 | **P3 endpoint split**: `S3_PUBLIC_ENDPOINT_URL` for handed-out presigned URLs (host-reachable) vs `S3_ENDPOINT_URL` for container ops; SigV4 only (v2 breaks on client Content-Type); bucket CORS bootstrapped from `CORS_ORIGINS` at startup. |
 | 13 | **P3.5 UI (via plan-mode Q&A)**: React + Vite + TS in `web/` (same repo); tokens in localStorage + auto-refresh on 401 (reload keeps the session); full upload queue — drag & drop incl. folder drop, per-file XHR progress + cancel, retry-failed-only, dedup + oversize badges; test-aids status strip (live /readyz dots + 429 countdown); **zero backend changes**. |
+| 14 | **P4 queue design (via plan-mode Q&A)**: **enqueue + sweep** (API enqueues after complete's commit; worker cron re-enqueues unclaimed rows — covers a dead API mid-enqueue and dead Redis); **full skeleton** (claim→processing→done; `_run_pipeline` is the seam P5/P6 replace with zero worker changes; doc_topic stays NULL until P6); **3 tries, exponential backoff** (5s·2^(n-1) capped 300s) → terminal `status=failed` + error text browsable in the UI. |
 
 ## Phases
 
@@ -29,7 +30,7 @@ Running log of phases, verification evidence, and known gaps. Updated after ever
 | P2 | Auth: register/login/refresh rotation/logout, rate limiting | ✅ done (verified 2026-11-12) |
 | P3 | Upload flow: presigned init/complete, dedup, validation, keyset pagination | ✅ done (verified 2026-11-13) |
 | P3.5 | React testing UI in `web/`: auth + auto-refresh, presigned upload queue (progress/cancel/retry/dedup badges), filter grid | ✅ done (verified 2026-11-14) |
-| P4 | Queue + worker skeleton: ARQ, idempotency, retry/backoff, crash recovery | pending |
+| P4 | Queue + worker skeleton: ARQ, idempotency, retry/backoff, crash recovery | ✅ done (verified 2026-11-14) |
 | P5 | Image pipeline: InsightFace faces, pgvector clustering, CLIP labels | pending |
 | P6 | PDF/Office/text pipelines: extraction + topic labels | pending |
 | P7 | Browse + curate APIs: people/labels, rename/merge/unassign/delete | pending |
@@ -73,8 +74,8 @@ line" rule):
 ## Known gaps (carried, resolved in later phases)
 
 - ~~S3 (SeaweedFS) readiness check lands in P3~~ **done in P3** (readyz s3:up).
-- Orphan init rows (init without complete) linger; cleanup sweeps land in P4.
-- Dockerfile `worker` target exists but inert (no `app.workers` until P4).
+- ~~Orphan init rows (init without complete) linger; cleanup sweeps land in P4~~ **done in P4** (`sweep_uploads` deletes sha256-NULL rows older than `ORPHAN_INIT_MINUTES`).
+- ~~Dockerfile `worker` target exists but inert (no `app.workers` until P4)~~ **live in P4** (`arq app.workers.settings.WorkerSettings` runs the pipeline + sweep).
 - `/metrics` exposes default process metrics only; RED HTTP metrics land in P8.
 - README still stage-1 placeholder; rewritten in P9 with architecture/scaling docs.
 - ML deps (insightface, open_clip, torch, PyMuPDF, office parsers) added in P5/P6.
@@ -354,6 +355,87 @@ Bugs caught by testing this phase:
 
 Known gaps from P3.5 (carried): oversize badge (>25 MB) verified by code
 reading + server 422 test only — `browser.files.drop` caps at 5 MiB so the
-real >25 MB drop is a manual test item; orphan init rows from canceled
-uploads await the P4 sweep; `web/` not Dockerized (dev-only UI until a P9
-decision on serving the build).
+real >25 MB drop is a manual test item; ~~orphan init rows from canceled
+uploads await the P4 sweep~~ **resolved in P4**; `web/` not Dockerized
+(dev-only UI until a P9 decision on serving the build).
+
+## P4 — Queue + worker skeleton (ARQ) ✅
+
+Built (user-locked: enqueue + sweep, full skeleton, 3 tries / exp backoff):
+
+- `app/workers/pipeline.py` — job coroutines (the worker's service layer):
+  - `process_file(ctx, file_id)`: claim guard (`uploaded`→`processing`→claim
+    commit; `done|failed` → skip; sha256 NULL → refuse — init rows are never
+    processable), `_run_pipeline(file)` **seam** (P4 no-op; P5/P6 replace the
+    body only), done commit; exception path: `job_try < WORKER_MAX_TRIES` →
+    `Retry(defer=5·2^(n-1) capped WORKER_RETRY_MAX_SECONDS)`; terminal →
+    `status=failed` + `error[:500]`.
+  - `sweep_uploads(ctx)`: enqueue candidates = `status=uploaded AND sha256 IS
+    NOT NULL` (same canonical `_job_id` → arq dedups; API-down/Redis-down
+    crashes recover within one interval) + delete orphan inits
+    (`sha256 IS NULL AND created_at < ORPHAN_INIT_MINUTES`) — no S3 cleanup
+    needed (no PUT → no object).
+- `app/workers/settings.py` — `WorkerSettings` for
+  `arq app.workers.settings.WorkerSettings`: cron sweep quantized onto the
+  minute grid (`second={0,30}` at the 30s default), `run_at_startup`,
+  `unique`, `keep_result=0`, `max_tries=WORKER_MAX_TRIES`; startup/shutdown
+  mirror the API lifespan (session factory + StorageService → ctx; logging
+  configured → every worker line is JSON).
+- `app/services/files.py` — `_enqueue_process` after a processable commit:
+  best-effort (`enqueue_failed` logged, request never fails — the sweep is
+  the net); dedup path enqueues nothing (the original's job already ran).
+- `app/repositories/files.py` — `list_enqueue_candidates` +
+  `delete_orphan_inits` (rowcount via CursorResult).
+- `app/api/deps.py` + `app/main.py` — `get_arq` provider + lifespan
+  `create_pool(RedisSettings.from_dsn(REDIS_URL))` (lazy connect: the API
+  boots even with Redis down), `aclose` on shutdown.
+- `docker-compose.yml` — `worker` service (`target: worker`), same env as
+  api + sweep/try knobs, health-gated depends_on.
+- `.env.example` — SWEEP_INTERVAL_SECONDS / ORPHAN_INIT_MINUTES /
+  WORKER_MAX_TRIES / WORKER_RETRY_{BASE,MAX}_SECONDS.
+- `tests/test_worker.py` — 9 tests vs real DB + Redis db 15: claim→done,
+  skip-when-done, missing, refuse-init-row, Retry defers 5s (ms 5000) and
+  leaves the row processing, terminal `failed` + error text, sweep enqueues
+  (job key exists; zset score unchanged on second sweep = idempotent),
+  sweep ignores init rows, backdated orphan deleted / fresh orphan kept,
+  API complete → `arq:job:process:{id}` exists.
+- `scripts/p4_live_check.ps1` — 10-check live walkthrough through the REAL
+  worker process.
+
+Verified (2 full passes as required):
+
+- Pass 1: ruff ✓ mypy ✓ (45 files), pytest **55/55** (46 prior + 9 worker).
+- Pass 2: identical full gate again (below, after docs).
+- Live (rebuilt api+worker images): startup sweep **enqueued 194 unclaimed
+  backlog rows from P3 test/live history — all processed to done within
+  seconds** (crash recovery demonstrated against real accumulated data);
+  `scripts/p4_live_check.ps1` **10/10** — readyz; text upload → complete →
+  status=uploaded → **worker-processed done** (polled); Matrix A bat →
+  other+done at complete with no queue; dedup → existing row, no new
+  processing; kind+status filter over processed rows; cleanup 204s.
+
+Bugs caught by testing this phase:
+
+1. **Event-loop/pool race resurfaced (P1 lesson #3)**: direct-call worker
+   tests using the module-level engine crashed with proactor
+   `NoneType.send` on the second test (pytest-asyncio fresh loop per test vs
+   pooled connections). Fixed with the established house pattern: per-test
+   NullPool session factory, passed to the jobs via `ctx["session_factory"]`
+   — which is exactly why the jobs read their factory from ctx.
+2. Exact-count sweep assertions were wrong by design: the dev DB legitimately
+   holds unclaimed rows from earlier runs, and the sweep's contract is
+   global — assertions now scope to the test's own row (job-key existence +
+   queue zset score unchanged across a second sweep proves idempotency
+   without global counts).
+3. arq 0.28 `Retry` stores `defer_score` (int ms), not `defer` — caught by
+   mypy before any false-pass.
+4. mypy: `Result` has no `rowcount` in the static type — cast to
+   `CursorResult[Any]` for the orphan delete (asyncpg returns one for DML).
+
+Known gaps from P4 (carried): `processing` rows orphaned by a SIGKILLed
+worker are recovered by arq's own `retry_jobs` on worker restart (no
+row-level sweep for them yet — P8 hardening can add a watchdog if it ever
+matters); retry-test artifacts leave `processing`/`failed` rows in the dev
+DB (test-only; unique per run, no dedup collisions); worker image not
+verified against a truly cold start of ALL services
+simultaneously (compose health-gating covers the ordering).

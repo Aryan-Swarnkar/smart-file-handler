@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Annotated
 
+from arq.connections import ArqRedis
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
@@ -101,11 +102,19 @@ def get_storage(request: Request) -> StorageService:
     return storage
 
 
+def get_arq(request: Request) -> ArqRedis:
+    pool: ArqRedis | None = getattr(request.app.state, "arq", None)
+    if pool is None:  # lifespan never ran — fail loudly, not mysteriously
+        raise RuntimeError("ARQ pool not initialized; lifespan did not run.")
+    return pool
+
+
 def files_service(
     session: Annotated[AsyncSession, Depends(get_session)],
     storage: Annotated[StorageService, Depends(get_storage)],
+    arq_pool: Annotated[ArqRedis, Depends(get_arq)],
 ) -> FileService:
-    return FileService(session, storage)
+    return FileService(session, storage, arq_pool)
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]

@@ -91,6 +91,38 @@ services:
       s3:
         condition: service_healthy
 
+  worker:
+    # ARQ worker (P4): pipeline jobs + crash-recovery sweep. Same image, the
+    # Dockerfile's `worker` target. Shares redis db 0 with the API: the API
+    # enqueues, the worker consumes + sweeps unclaimed rows.
+    build:
+      context: .
+      target: worker
+    restart: unless-stopped
+    environment:
+      ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-smart_file_handler}
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://s3:8333
+      S3_PUBLIC_ENDPOINT_URL: http://localhost:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-smart-file-handler}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+      SWEEP_INTERVAL_SECONDS: ${SWEEP_INTERVAL_SECONDS:-30}
+      ORPHAN_INIT_MINUTES: ${ORPHAN_INIT_MINUTES:-60}
+      WORKER_MAX_TRIES: ${WORKER_MAX_TRIES:-3}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      s3:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   redis_data:

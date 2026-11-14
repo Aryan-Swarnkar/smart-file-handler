@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     # --- uploads ---------------------------------------------------------------
     MAX_UPLOAD_MB: int = 25
 
+    # --- queue / worker (P4) -----------------------------------------------------
+    # The API enqueues a job right after complete commits; the worker-side sweep
+    # is the crash-recovery net (API died mid-enqueue, Redis was down, or the
+    # enqueue failed). Orphan init rows (bytes never PUT, presigned URL long
+    # expired) are deleted by the same sweep after a grace window.
+    SWEEP_INTERVAL_SECONDS: int = 30
+    ORPHAN_INIT_MINUTES: int = 60
+    WORKER_MAX_TRIES: int = 3
+    WORKER_RETRY_BASE_SECONDS: int = 5
+    WORKER_RETRY_MAX_SECONDS: int = 300
+
     # --- HTTP -------------------------------------------------------------------
     # Comma-separated origins; empty string disables CORS middleware.
     CORS_ORIGINS: str = ""

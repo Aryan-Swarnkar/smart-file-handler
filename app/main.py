@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from arq import create_pool
+from arq.connections import RedisSettings
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -35,6 +37,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = Redis.from_url(
             settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2
         )
+        # ARQ enqueue pool (same Redis, arq's job schema). Lazy connect — the
+        # API must boot even when Redis is down (readyz reports it).
+        app.state.arq = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
         # Object storage client (S3-compatible: SeaweedFS dev, S3/R2 prod).
         # The bucket is created idempotently here so replicas never depend on
         # an init container.
@@ -45,6 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            await app.state.arq.aclose()
             await app.state.redis.aclose()
             await storage.close()
             await engine.dispose()

@@ -10,20 +10,22 @@ Reading order convention:
 
 ---
 
-## System map (current: after Phase 3)
+## System map (current: after Phase 3.5)
 
 ```
-Browser/curl ──HTTP──▶ API (uvicorn, FastAPI) ──▶ structlog JSON logs
-                        │            │
-                        │            ├─▶ Redis (readiness ping, auth rate limits)
-                        │            ├─▶ PostgreSQL 16+pgvector (SELECT 1 + auth/files ORM)
-                        │            ├─▶ SeaweedFS S3 API (presigned PUT/GET, head, delete)
-                        │            │      ▲ bytes go client→S3 DIRECTLY (presigned URLs)
-                        │            └─▶ /metrics (prometheus-client)
-                        └─▶ /metrics
+web/ React UI (Vite :5173) ──▶ API (uvicorn, FastAPI) ──▶ structlog JSON logs
+        │  presigned PUT bytes ──▶ SeaweedFS :9000 (direct, CORS-allowed)     ▲
+        │                              │            │
+        └──HTTP──▶ API                 │            ├─▶ Redis (readiness ping, auth rate limits)
+                       │               │            ├─▶ PostgreSQL 16+pgvector (SELECT 1 + auth/files ORM)
+                       │               │            ├─▶ SeaweedFS S3 API (presigned PUT/GET, head, delete)
+                       │               │            │      ▲ bytes go client→S3 DIRECTLY (presigned URLs)
+                       │               │            └─▶ /metrics (prometheus-client)
+                       │               └─▶ /metrics
+                       └─▶ /readyz polled every 15s by web/src/components/StatusStrip.tsx
 ```
 
-## File responsibility map (current: after Phase 3)
+## File responsibility map (current: after Phase 3.5)
 
 | File | Owns | Used by |
 |---|---|---|
@@ -58,6 +60,21 @@ Browser/curl ──HTTP──▶ API (uvicorn, FastAPI) ──▶ structlog JSON
 | `tests/test_auth.py` | 18 auth integration tests (register/login/refresh/logout/429) | pytest |
 | `tests/test_files.py` | 19 files integration tests (real SeaweedFS PUT/GET: kinds, sniff-wins, dedup, 409/422, pagination, 404 matrix, rename/delete, **presign public endpoint**) | pytest |
 | `scripts/p3_live_check.ps1` | 29-check live walkthrough of every files route + readyz + CORS preflight | manual verification |
+| `web/src/types.ts` | TS mirrors of `app/schemas/{auth,files}.py` + `ApiErrorBody` envelope + `ReadyBody`; `fmtBytes`/`fmtDate` helpers | every web module (kept in sync manually) |
+| `web/src/api/session.ts` | Token store on localStorage (`sfh.access`/`sfh.refresh`) + tiny listener registry so the fetch client can wipe a dead session | client, AuthContext |
+| `web/src/api/client.ts` | Fetch wrapper: `API_URL` (from `VITE_API_URL`), bearer header, envelope→`ApiError`, **single-flight 401→refresh→replay** (`_retried` bound, refresh rotates single-use tokens so parallel 401s share ONE refresh) | all web api modules |
+| `web/src/api/auth.ts` | `/auth/*` calls; logout sends the refresh token in the BODY (no Bearer), always-204 | AuthContext |
+| `web/src/api/files.ts` | `/files/*` calls: init/complete/list (cursor passed verbatim)/url/PATCH/DELETE | UploadQueue, FileGrid |
+| `web/src/api/upload.ts` | **XHR PUT** to the presigned URL (XHR not fetch: only browser primitive with upload progress events + abort); no auth header — SigV4 signature IS the authorization | UploadQueue |
+| `web/src/state/AuthContext.tsx` | Hydrates session on load (`me()`), login/register/logout, reacts to external `session.clear()` (dead-refresh path) | App |
+| `web/src/components/StatusStrip.tsx` | Polls PUBLIC `/readyz` every 15s → 3 dots (redis/db/s3) + "all up"/"degraded"/"API unreachable" | Shell topbar |
+| `web/src/components/AuthScreens.tsx` | Login/Register tabs; envelope errors shown verbatim (429 shows countdown via Toaster) | App |
+| `web/src/components/Dropzone.tsx` | Drag & drop files OR folders (entries grabbed synchronously, then walked recursively; `readEntries` batch loop) + file/folder pickers; synthetic-drop fallback to `dataTransfer.files` | Shell |
+| `web/src/components/UploadQueue.tsx` | `useUploadQueue` hook (state in ref-mirror so async continuations see the latest list) + `UploadQueueView`: per-file init→PUT(progress 0–90%)→complete→done|dedup|failed|canceled, concurrency 3, cancel via AbortController, retry-failed-only, 25 MB client-side pre-check (server re-verifies) | Shell |
+| `web/src/components/FileGrid.tsx` | Cards over real keyset pagination (cursor + "Load more"), kind/status/topic filters with **stale-response seq guard** (rapid filter changes: only the latest fetch may touch state), view/download (presigned URLs), rename (double-click inline), delete (confirm dialog) | Shell |
+| `web/src/components/Toaster.tsx` | Event-based toasts (`sfh-toast` CustomEvent, no prop drilling); 429 renders a live countdown from `details.retry_after_seconds` | App root |
+| `web/src/App.tsx` / `main.tsx` / `styles.css` | Shell composition (queue hoisted via `useUploadQueue`), React 18 mount, dark theme (no CSS framework) | — |
+| `web/vite.config.ts` / `tsconfig.json` / `package.json` | Vite dev server on 5173 (the origin whitelisted by API CORS + bucket CORS), TS strict (`noUnusedLocals` etc.), React 18 + Vite 5 + TS 5.6 | `npm run dev` / `npm run build` |
 | `Dockerfile` | multi-stage build: `builder` → `api` / `worker` targets | compose, CI |
 | `docker-compose.yml` | postgres(pgvector), redis, seaweedfs(S3), api | local dev |
 | `deploy/seaweedfs/s3.json` | SeaweedFS S3 credentials (dev creds `minioadmin`) | s3 container |
@@ -426,7 +443,61 @@ cursors.
 SeaweedFS is the user-approved local S3 backend; production uses S3/R2 via
 aioboto3 — identical code path (S3 API), only the dev container differs.
 
-## Technologies in play (through Phase 3)
+## Workflow 11 — Testing UI (Phase 3.5, `web/`)
+
+Zero backend changes — the UI is a pure consumer of the P2/P3 contracts. Run:
+`npm run dev` in `web/` (Vite on :5173, the origin whitelisted by API CORS and
+the SeaweedFS bucket CORS). `npm run build` = strict `tsc` + Vite bundle.
+
+**Session lifecycle** (`web/src/api/session.ts` + `client.ts` +
+`state/AuthContext.tsx`):
+
+1. On load, if localStorage has tokens → `me()` (which auto-refreshes on 401)
+   → main screen; dead session → login screen.
+2. `api()` wrapper: every non-2xx body is the backend envelope → `ApiError`
+   (status, code, message, details, request_id). On 401 with a refresh token
+   present: ONE shared `refreshInFlight` promise (parallel 401s must not burn
+   several single-use rotation tokens) → on success the NEW pair is persisted
+   (rotation!) and the request is replayed exactly once (`_retried` flag
+   bounds the loop) → on failure `session.clear()` → AuthContext flips to the
+   login screen.
+3. Logout: POST `/auth/logout` with the refresh token in the body → always
+   204 → tokens cleared.
+
+**Upload flow** (`components/Dropzone.tsx` → `components/UploadQueue.tsx`):
+
+1. Drop files or a FOLDER: entries are read synchronously inside the drop
+   handler (the DataTransferItemList dies after the microtask), then walked
+   recursively (`readEntries` looped until an empty batch — it returns in
+   pages of ~100). No entries (synthetic drop, plain files) → fall back to
+   `dataTransfer.files`.
+2. Each file joins the queue: client-side 25 MB pre-check (oversize →
+   `failed` badge immediately; the server's 422 `details.max_bytes` stays
+   authoritative), else `waiting`.
+3. Concurrency 3: per file `POST /files/init` (201) → **XHR** PUT of the raw
+   File to the presigned URL with `upload.progress` events (0–90% bar) →
+   `POST /files/{id}/complete` (200) → `done`, or `♻️ dedup` when the
+   response's `deduplicated: true`. XHR (not fetch) is the only browser
+   primitive with upload progress + abort.
+4. Cancel: AbortController → `xhr.abort()` → item marked `canceled`. The
+   orphan init row (never completed) is swept by the P4 worker by design.
+5. `Retry failed` re-queues only `failed` items; `Clear finished` drops
+   done/dedup/canceled rows. Every successful complete bumps the grid's
+   `refreshSignal` → page 1 refetch.
+
+**Browse** (`components/FileGrid.tsx`): cards from real keyset pagination
+(`next_cursor` passed back verbatim, "Load more" appends). Kind/status/topic
+filters refetch page 1; a **seq guard** makes a stale in-flight response a
+no-op (rapid filter flips otherwise let the last-ARRIVING response win, not
+the last-ISSUED request). View/download fetch presigned URLs (`download=true`
+adds the attachment disposition). Rename = double-click → inline form →
+`PATCH`. Delete = `window.confirm` → `DELETE` → row removed locally.
+
+**Test aids**: `StatusStrip` polls the PUBLIC `/readyz` every 15s and shows a
+dot per dependency + "all up"/"degraded"/"API unreachable". `Toaster` renders
+429s with a live countdown built from `details.retry_after_seconds`.
+
+## Technologies in play (through Phase 3.5)
 
 - **FastAPI** (ASGI) + **uvicorn** — HTTP layer, fully async handlers.
 - **pydantic-settings v2** — `Settings`; env vars > `.env` > code defaults;
@@ -452,3 +523,6 @@ aioboto3 — identical code path (S3 API), only the dev container differs.
   (internal client vs public presigner) keeps container networking honest.
 - **uv** — locked, cached dependency installs (host + Docker builder).
 - **Docker Compose** — 4-service local stack with health-gated startup.
+- **React 18 + Vite 5 + TypeScript 5.6 (strict)** — `web/` testing UI; zero
+  runtime deps beyond react/react-dom; XHR for upload progress; localStorage
+  token store; CSS hand-rolled (no framework).

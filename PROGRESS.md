@@ -18,6 +18,7 @@ Running log of phases, verification evidence, and known gaps. Updated after ever
 | 10 | **`docs/WORKFLOW.md`** — single living workflow doc (click → function → file → algorithm → technology), updated after every phase. User-requested. |
 | 11 | **P3 upload design (9 decisions via Q&A)**: presigned init/complete (bytes bypass API); duplicate → EXISTING row + `deduplicated: true` + duplicate object deleted; hard delete (row + S3 object); thumbnails deferred to P5; P3 browse = filters only; **sniff wins** (fake .jpg → other); office = ZIP magic + extension; PATCH rename; 20/page max 100, newest-first, opaque base64 cursor. |
 | 12 | **P3 endpoint split**: `S3_PUBLIC_ENDPOINT_URL` for handed-out presigned URLs (host-reachable) vs `S3_ENDPOINT_URL` for container ops; SigV4 only (v2 breaks on client Content-Type); bucket CORS bootstrapped from `CORS_ORIGINS` at startup. |
+| 13 | **P3.5 UI (via plan-mode Q&A)**: React + Vite + TS in `web/` (same repo); tokens in localStorage + auto-refresh on 401 (reload keeps the session); full upload queue — drag & drop incl. folder drop, per-file XHR progress + cancel, retry-failed-only, dedup + oversize badges; test-aids status strip (live /readyz dots + 429 countdown); **zero backend changes**. |
 
 ## Phases
 
@@ -27,6 +28,7 @@ Running log of phases, verification evidence, and known gaps. Updated after ever
 | P1 | DB + Alembic async: models, initial migration + vector extension | ✅ done (verified 2026-11-12) |
 | P2 | Auth: register/login/refresh rotation/logout, rate limiting | ✅ done (verified 2026-11-12) |
 | P3 | Upload flow: presigned init/complete, dedup, validation, keyset pagination | ✅ done (verified 2026-11-13) |
+| P3.5 | React testing UI in `web/`: auth + auto-refresh, presigned upload queue (progress/cancel/retry/dedup badges), filter grid | ✅ done (verified 2026-11-14) |
 | P4 | Queue + worker skeleton: ARQ, idempotency, retry/backoff, crash recovery | pending |
 | P5 | Image pipeline: InsightFace faces, pgvector clustering, CLIP labels | pending |
 | P6 | PDF/Office/text pipelines: extraction + topic labels | pending |
@@ -283,3 +285,75 @@ Known gaps from P3 (carried): orphan init rows (init-without-complete)
 cleanup lands in P4; complete's single-pass hash+sniff is fine at 25 MB but
 multipart/large-object support would need range reads (P9 decision);
 `status` filter is exact-match only.
+
+## P3.5 — React testing UI (`web/`) ✅
+
+Built (zero backend changes — pure consumer of the P2/P3 contracts):
+
+- Scaffold: `web/package.json` (react 18 + react-dom only), `vite.config.ts`
+  (dev server :5173 — the whitelisted CORS origin), `tsconfig.json` (strict:
+  noUnusedLocals/Parameters, noFallthrough), `index.html`, `.gitignore`.
+- `src/types.ts` — TS mirrors of the Pydantic schemas + error envelope +
+  `/readyz` body (manual sync; a generated client was overkill).
+- `src/api/session.ts` — localStorage token store with a listener registry
+  (the fetch client can wipe a dead session; AuthContext reacts).
+- `src/api/client.ts` — fetch wrapper: bearer header, envelope → `ApiError`
+  (status/code/details/request_id), **single-flight 401 → refresh → replay
+  once** (`_retried` bound; parallel 401s share one refresh because rotation
+  tokens are single-use; dead refresh → `session.clear()` → login screen).
+- `src/api/{auth,files,upload}.ts` — endpoint callers; `upload.ts` is the
+  **XHR PUT** to presigned URLs (only browser primitive with upload progress
+  + abort; no auth header — the SigV4 signature is the authorization).
+- `src/state/AuthContext.tsx` — hydrate on load (`me()`), login/register/
+  logout, external-clear subscription.
+- `src/components/` — `AuthScreens` (login/register + envelope errors),
+  `StatusStrip` (public `/readyz` poll → 3 dots + "all up"), `Toaster`
+  (event-based; 429 shows a live countdown from `details.retry_after_seconds`),
+  `Dropzone` (files AND folders: entries grabbed synchronously, walked
+  recursively with batched `readEntries`; synthetic-drop fallback),
+  `UploadQueue` (`useUploadQueue` hook + view: concurrency 3, XHR progress
+  bar, cancel via AbortController, retry-failed-only, clear-finished, 25 MB
+  client-side pre-check → oversize badge), `FileGrid` (cards over real keyset
+  pagination + kind/status/topic filters + stale-response seq guard, view/
+  download via presigned URLs, double-click rename, confirm-dialog delete).
+- `src/App.tsx`/`main.tsx`/`styles.css` — dark shell, queue hoisted so the
+  Dropzone feeds it; every successful complete bumps the grid refresh.
+
+Verified (2 full passes as required):
+
+- Pass 1 (2026-11-13, browser): register via UI form (201) → main screen with
+  status strip "all up" (live readyz polling); synthetic DragEvent with 7
+  magic-byted files (jpg/png/pdf/docx/txt/csv/bat) → **all 7 uploaded**: init
+  201×7 → presigned PUT 200×7 → complete 200×7; queue showed per-file done
+  states + "Clear finished (7)"; network log confirmed the full contract
+  incl. CORS preflights; zero console errors; `npm run build` clean (161 KB
+  JS gzip 52 KB).
+- Pass 2 (2026-11-14, browser + backend gates): dedup re-drop of photo.jpg →
+  ♻️ "duplicate: linked to the existing file" (complete 200 `deduplicated`).
+  Filter matrix ×5: kind=image → 2; image+status=done → none; status=done →
+  setup.bat only; topic=other → setup.bat only; reset → all. Rename via
+  double-click → PATCH 200 → card updated (+renamed back). Delete → confirm
+  dialog → row gone **server-side** (6 files remain). Logout → tokens
+  cleared → reload stays logged out → login again → reload → session
+  persists (auto-refresh path). Backend regression: ruff ✓ mypy ✓ (41 files),
+  pytest **46/46**, `scripts/p3_live_check.ps1` **29/29**.
+
+Bugs caught by testing this phase:
+
+1. **FileGrid stale-response race** (found live): rapid filter changes left
+   several fetches in flight; the last-ARRIVING response won regardless of
+   which request was issued last (filter results flickered wrong). Fixed
+   with a monotonic seq guard — a superseded fetch may not touch state.
+2. Dropzone synthetic-drop hole: when `webkitGetAsEntry` existed but returned
+   null for every item (scripted drops), files were silently dropped.
+   Rewritten to an entries-length check with `dataTransfer.files` fallback.
+3. client.ts 401-replay could loop in principle on a fresh-but-rejected
+   token; bounded with the `_retried` flag (exactly one replay).
+4. `npm audit`: 2 dev-advisories inside the Vite 5 toolchain (build-time
+   only, not shipped code); Vite 6/7 upgrade deferred — noted, not blocking.
+
+Known gaps from P3.5 (carried): oversize badge (>25 MB) verified by code
+reading + server 422 test only — `browser.files.drop` caps at 5 MiB so the
+real >25 MB drop is a manual test item; orphan init rows from canceled
+uploads await the P4 sweep; `web/` not Dockerized (dev-only UI until a P9
+decision on serving the build).

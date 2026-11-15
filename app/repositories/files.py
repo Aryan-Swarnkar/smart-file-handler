@@ -13,10 +13,11 @@ import uuid
 from datetime import datetime
 from typing import NamedTuple
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import File, FileKind, FileStatus
+from app.repositories.folders import FOLDER_CHAIN_SQL, MAX_TREE_DEPTH, FolderAccessRow
 
 
 class Page(NamedTuple):
@@ -106,3 +107,48 @@ class FileRepository:
     async def delete(self, file: File) -> None:
         await self._session.delete(file)
         await self._session.flush()
+
+    async def resolve_file_role(
+        self, file_id: uuid.UUID, actor_id: uuid.UUID
+    ) -> FolderAccessRow:
+        """Ownership + best grant (direct on the file OR on any ancestor
+        folder), plus the trashed-chain flag.
+
+        Self-contained statement (the folder chain CTE mirrors
+        repositories.folders — deliberate: each repo stays independently
+        readable, and the file variant needs file-side ownership + trash
+        columns anyway). The chain hangs off the file's folder_id; a file at
+        the drive top level has folder_id NULL → empty chain, only direct
+        grants and ownership apply.
+        """
+        row = (
+            await self._session.execute(
+                text(
+                    FOLDER_CHAIN_SQL
+                    + """
+SELECT
+    (SELECT fi.user_id FROM files fi WHERE fi.id = :file_id) = :actor_id AS is_owner,
+    EXISTS (
+        (SELECT 1 FROM files fi
+          WHERE fi.id = :file_id AND fi.deleted_at IS NOT NULL)
+        UNION ALL
+        (SELECT 1 FROM chain c WHERE c.deleted_at IS NOT NULL)
+    ) AS chain_trashed,
+    (SELECT p.role FROM permissions p
+      WHERE p.grantee_id = :actor_id
+        AND (p.file_id = :file_id OR p.folder_id IN (SELECT c2.id FROM chain c2))
+      ORDER BY CASE p.role WHEN 'editor' THEN 0 ELSE 1 END
+      LIMIT 1) AS granted_role
+"""
+                ),
+                {
+                    "file_id": file_id,
+                    "actor_id": actor_id,
+                    "max_depth": MAX_TREE_DEPTH,
+                },
+            )
+        ).one()
+        role: str | None = "owner" if row.is_owner else row.granted_role
+        return FolderAccessRow(
+            role=role, is_owner=row.is_owner, chain_trashed=row.chain_trashed
+        )

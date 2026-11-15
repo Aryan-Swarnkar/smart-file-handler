@@ -16,6 +16,7 @@ from app.db.models import User
 from app.db.session import get_session
 from app.services.auth import AuthService
 from app.services.file_service import FileService
+from app.services.folder_service import FolderService
 from app.services.security import decode_access_token
 from app.services.storage_service import StorageService
 
@@ -114,6 +115,11 @@ def files_service(
     return FileService(session, storage)
 
 
+def folders_service(session: Annotated[AsyncSession, Depends(get_session)]) -> FolderService:
+    return FolderService(session)
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AuthedService = Annotated[AuthService, Depends(auth_service)]
 FilesService = Annotated[FileService, Depends(files_service)]
+FoldersService = Annotated[FolderService, Depends(folders_service)]

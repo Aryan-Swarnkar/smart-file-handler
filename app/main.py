@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from redis.asyncio import Redis
 
-from app.api.routers import auth, files, health
+from app.api.routers import auth, files, folders, health
 from app.core.config import Settings, get_settings
 from app.core.errors import install_error_handlers
 from app.core.logging import RequestIdMiddleware, configure_logging, get_logger
@@ -78,6 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(files.router)
+    app.include_router(folders.router)
 
     # Explicit route instead of mounting make_asgi_app(): a mount 307-redirects
     # /metrics -> /metrics/, which looks broken to curl and simple scrapers.

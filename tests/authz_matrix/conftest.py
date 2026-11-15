@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
-from app.db.models import Folder, Permission, PermissionRole, User
+from app.db.models import File, Folder, Permission, PermissionRole, User
 from app.repositories.folders import FolderRepository
 from app.repositories.permissions import PermissionRepository
 from app.services.security import create_access_token
@@ -64,10 +64,16 @@ async def seed_grant(
     db: AsyncSession,
     grantee_id: uuid.UUID,
     role: PermissionRole,
-    folder: Folder,
+    target: Folder | File,
 ) -> Permission:
+    """Grant on a folder OR a file — mirrors PermissionRepository.create_grant,
+    which accepts exactly one target."""
+    if isinstance(target, Folder):
+        return await PermissionRepository(db).create_grant(
+            grantee_id=grantee_id, role=role, folder_id=target.id
+        )
     return await PermissionRepository(db).create_grant(
-        grantee_id=grantee_id, role=role, folder_id=folder.id
+        grantee_id=grantee_id, role=role, file_id=target.id
     )
 
 

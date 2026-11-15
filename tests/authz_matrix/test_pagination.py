@@ -263,6 +263,57 @@ async def test_children_of_trashed_folder_still_browsable_by_owner(
     assert [i["name"] for i in resp.json()["items"]] == ["child"]
 
 
+# --- cursor hardening (ties, odd names, bounds) ---------------------------------
+
+
+async def test_created_at_ties_exercise_id_tiebreak(
+    client: AsyncClient, db: AsyncSession, tree: Tree
+) -> None:
+    """Every child shares ONE created_at: the (created_at, id) keyset must
+    still walk all rows exactly once, ids strictly descending among the
+    ties (a plain created_at cursor without the id would loop forever)."""
+    parent = await _fresh_parent(db, tree)
+    seeded = [
+        await seed_folder(db, tree.owner.id, parent_id=parent.id, name=f"tie-{i}")
+        for i in range(6)
+    ]
+    stamp = datetime.now(UTC)
+    for folder in seeded:
+        folder.created_at = stamp
+    await commit(db)
+
+    items = await _walk_all(client, tree, parent, sort="created_at", limit=2)
+    assert len(items) == 6, f"walk lost rows: {items}"
+    assert {i["id"] for i in items} == {str(f.id) for f in seeded}
+    stamps = [(i["created_at"], i["id"]) for i in items]
+    assert stamps == sorted(stamps, reverse=True), "keyset invariant with ties"
+
+
+async def test_name_with_pipe_survives_cursor(
+    client: AsyncClient, db: AsyncSession, tree: Tree
+) -> None:
+    """Cursor payload 'n:<name>|<id>' is split at the LAST '|': names that
+    themselves contain '|' must survive an encode/decode round-trip."""
+    parent = await _fresh_parent(db, tree)
+    names = ["a-head", "we|rd|name", "also|pipe", "z-tail"]
+    await _seed_children(db, tree, parent, names)
+    items = await _walk_all(client, tree, parent, sort="name", limit=1)
+    assert [i["name"] for i in items] == sorted(names)
+
+
+async def test_limit_bounds_are_422(
+    client: AsyncClient, db: AsyncSession, tree: Tree
+) -> None:
+    parent = await _fresh_parent(db, tree)
+    for bad in ("0", "101"):
+        resp = await client.get(
+            f"/folders/{parent.id}/children",
+            headers=_owner_headers(tree),
+            params={"limit": bad},
+        )
+        assert resp.status_code == 422, f"limit={bad}: {resp.status_code} {resp.text}"
+
+
 # --- root discovery ----------------------------------------------------------------
 
 

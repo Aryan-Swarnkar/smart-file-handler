@@ -17,7 +17,25 @@ from sqlalchemy import select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import File, FileKind, FileStatus
-from app.repositories.folders import FOLDER_CHAIN_SQL, MAX_TREE_DEPTH, FolderAccessRow
+from app.repositories.folders import MAX_TREE_DEPTH, FolderAccessRow
+
+# Self at depth 1, walking UP while depth < cap — the FILE variant hangs the
+# chain off the file's folder_id via SUBSELECT: a NULL folder_id (top-level
+# file) or a missing file row both yield an EMPTY chain, so no None bind ever
+# reaches asyncpg. Mirrors FOLDER_CHAIN_SQL but stays local: the file variant
+# needs file-side ownership/trash columns anyway and evolves independently.
+FILE_CHAIN_SQL = """
+WITH RECURSIVE chain AS (
+    SELECT f.id, f.parent_id, f.owner_id, f.deleted_at, 1 AS depth
+    FROM folders f
+    WHERE f.id = (SELECT fi.folder_id FROM files fi WHERE fi.id = :file_id)
+  UNION ALL
+    SELECT p.id, p.parent_id, p.owner_id, p.deleted_at, c.depth + 1
+    FROM folders p
+    JOIN chain c ON p.id = c.parent_id
+    WHERE c.depth < :max_depth
+)
+"""
 
 
 class Page(NamedTuple):
@@ -114,17 +132,15 @@ class FileRepository:
         """Ownership + best grant (direct on the file OR on any ancestor
         folder), plus the trashed-chain flag.
 
-        Self-contained statement (the folder chain CTE mirrors
-        repositories.folders — deliberate: each repo stays independently
-        readable, and the file variant needs file-side ownership + trash
-        columns anyway). The chain hangs off the file's folder_id; a file at
-        the drive top level has folder_id NULL → empty chain, only direct
-        grants and ownership apply.
+        One statement on FILE_CHAIN_SQL: the chain hangs off the file's
+        folder_id (subselect — NULL for a top-level file → empty chain, only
+        direct grants and ownership apply). A missing file row resolves to
+        role=None/chain clean; the service maps None → 404.
         """
         row = (
             await self._session.execute(
                 text(
-                    FOLDER_CHAIN_SQL
+                    FILE_CHAIN_SQL
                     + """
 SELECT
     (SELECT fi.user_id FROM files fi WHERE fi.id = :file_id) = :actor_id AS is_owner,

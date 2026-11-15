@@ -199,3 +199,30 @@ async def test_locked_check_rejects_a_move_raced_by_trash(
 
     result = await _attempt_move(_factory(engine_b), owner_id, a_id, b_id)
     assert result == ("conflict", "trashed"), result
+
+
+@pytest.mark.parametrize("iteration", range(3))
+async def test_different_owners_moves_never_block(
+    db: AsyncSession, engine_a: AsyncEngine, engine_b: AsyncEngine, iteration: int
+) -> None:
+    """Advisory keys are per-owner: two owners racing moves on their OWN
+    trees must both succeed. A cross-owner rejection would mean the lock
+    key (or the authz chain) leaks across owners."""
+    from tests.authz_matrix.conftest import seed_folder
+
+    o1 = await seed_user(db)
+    r1 = await seed_folder(db, o1.id, name="root1")
+    a1 = await seed_folder(db, o1.id, parent_id=r1.id, name="A1")
+    b1 = await seed_folder(db, o1.id, parent_id=r1.id, name="B1")
+    o2 = await seed_user(db)
+    r2 = await seed_folder(db, o2.id, name="root2")
+    a2 = await seed_folder(db, o2.id, parent_id=r2.id, name="A2")
+    b2 = await seed_folder(db, o2.id, parent_id=r2.id, name="B2")
+    await commit(db)
+
+    results = await asyncio.gather(
+        _attempt_move(_factory(engine_a), o1.id, a1.id, b1.id),
+        _attempt_move(_factory(engine_b), o2.id, a2.id, b2.id),
+    )
+    assert [r[0] for r in results] == ["ok", "ok"], results
+    assert [r[1] for r in results] == [str(b1.id), str(b2.id)], results

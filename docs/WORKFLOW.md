@@ -332,10 +332,11 @@ client                        API                           SeaweedFS
    - **idempotent**: `sha256` already set → return the same result again
      (at-least-once client retries are safe);
    - `storage.head(key)` → object missing → 409 `upload_not_found` (client
-     never PUT or URL expired); `ContentLength != declared size` → 422
-     `size_mismatch` (presigned PUTs don't enforce size — THIS is the real
-     size gate);
-   - `read_head(key, 8192)` (`SNIFF_SAMPLE_BYTES`) → `sniff()` pure
+     never PUT or URL expired); `ContentLength != declared size` → 409
+     `size_mismatch` (the presigned PUT is Content-Length-bound: a wrong-
+     length PUT is rejected 403 upstream — the HEAD check is the defensive
+     backstop for objects that reach the key by other means);
+   - `read_range(key, 8192)` (`SNIFF_SAMPLE_BYTES`) → `sniff()` pure
      classifier (`app/services/sniffing.py`), matrix locked with the user:
      magic bytes decide; a fake `.jpg` (MZ/exe bytes) → `kind=other` —
      **sniff wins over the filename**;

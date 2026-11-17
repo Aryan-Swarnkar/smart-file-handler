@@ -68,20 +68,39 @@ class FileRepository:
         mime_type: str,
         size_bytes: int,
         storage_key: str,
+        status: FileStatus = FileStatus.UPLOADED,
+        folder_id: uuid.UUID | None = None,
+        upload_expires_at: datetime | None = None,
     ) -> File:
+        """Insert one file row. Phase 5 init passes status=PENDING_UPLOAD +
+        upload_expires_at (quota already reserved by the caller); completed
+        uploads are backfilled by tests with the old 'uploaded' default."""
         file = File(
             user_id=user_id,
+            folder_id=folder_id,
             original_name=original_name,
             mime_type=mime_type,
             size_bytes=size_bytes,
             storage_key=storage_key,
-            status=FileStatus.UPLOADED,
+            status=status,
             kind=None,
             sha256=None,
+            upload_expires_at=upload_expires_at,
         )
         self._session.add(file)
         await self._session.flush()
         return file
+
+    async def get_fresh(self, file_id: uuid.UUID) -> File | None:
+        """Re-select and overwrite the identity-map copy — decisions must
+        reflect what a concurrent transaction just committed, never a cached
+        stale status (double-complete detection depends on this)."""
+        stmt = (
+            select(File)
+            .where(File.id == file_id)
+            .execution_options(populate_existing=True)
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none()
 
     async def get_by_id(self, file_id: uuid.UUID) -> File | None:
         return await self._session.get(File, file_id)

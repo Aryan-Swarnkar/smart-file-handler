@@ -15,7 +15,7 @@ clients upload/download without proxying bytes through the API.
 | Presigned PUT | `presign_put()` | URL-only upload: client → S3 directly; API never sees the bytes. Signed against the **public** endpoint |
 | Presigned GET | `presign_get()` | Opaque, expiring view URLs; `download=true` → `ResponseContentDisposition: attachment` |
 | Dual endpoint | `app/core/config.py` | `S3_ENDPOINT_URL` (internal ops, e.g. `s3:8333`) vs `S3_PUBLIC_ENDPOINT_URL` (handed-out URLs, e.g. `localhost:9000`) — **presigned URLs embed the host they were signed for; it must be one the client can reach** |
-| Streaming read | `read()` / `read_head()` | 1 MiB chunks (`READ_CHUNK_BYTES`), generator + deterministic `aclose()` — constant memory |
+| Streaming read | `read()` / `read_range()` | `read()`: 1 MiB chunks (`READ_CHUNK_BYTES`), generator + deterministic `aclose()` — constant memory; `read_range()`: ranged GET for the sniff probe (server-side cutoff, replaces the removed `read_head`) |
 | Health | `storage.ping()` | HeadBucket in `/readyz` (`app/api/routers/health.py`) |
 
 ## Why presigned URLs (architecture decision)

@@ -34,6 +34,10 @@ SEARCH_VECTOR_EXPR = (
 
 
 class FileStatus(enum.StrEnum):
+    # pending_upload: init'd, quota reserved, bytes not yet verified by
+    # /complete (Phase 5). uploaded: verified + outbox row written — the
+    # Phase 6 worker claims it from here.
+    PENDING_UPLOAD = "pending_upload"
     UPLOADED = "uploaded"
     PROCESSING = "processing"
     DONE = "done"
@@ -126,6 +130,12 @@ class File(Base, CreatedAtMixin):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )  # trash (Phase 10); NULL = live row
+
+    # Phase 5: set at init (now + UPLOAD_TTL); a pending row past this stamp
+    # is abandoned — the Phase 6 sweeper deletes it and releases the quota.
+    upload_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # GENERATED ALWAYS ... STORED: maintained by the DB when name/text change,
     # so Phase 9 search reads it and Phase 7's text write updates it for free.

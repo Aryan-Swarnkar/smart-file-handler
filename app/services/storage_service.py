@@ -19,6 +19,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.services.sniffing import sanitize_filename
 
 if TYPE_CHECKING:
     # Service-specific stubs (types-aioboto3) give fully-typed S3 methods;
@@ -169,9 +170,12 @@ class StorageService:
     async def presign_put(self, key: str, content_length: int) -> tuple[str, int]:
         """PUT url for the declared size.
 
-        ContentLength rides in the request template, not the URL (SigV4
-        presigned URLs sign only the host) — the DEFINITIVE size check is
-        HEAD-vs-declared at complete_upload (size_mismatch).
+        ContentLength rides in the request template AND the SigV4 signed
+        headers: a PUT whose Content-Length differs from the declared size
+        is rejected by storage with 403 (empirically enforced by
+        SeaweedFS) — a lying client cannot even store. complete_upload
+        keeps a defensive HEAD-vs-declared check (size_mismatch) for any
+        object that reaches the key by other means.
         """
         client = self._presigner()
         expires = self._settings.PRESIGNED_URL_EXPIRE_SECONDS
@@ -186,20 +190,40 @@ class StorageService:
         )
         return url, expires
 
-    async def presign_get(self, key: str, download: bool) -> tuple[str, int]:
-        """GET url. download=True forces a save-as filename from the key."""
+    async def presign_get(
+        self,
+        key: str,
+        download: bool,
+        filename: str | None = None,
+        *,
+        expires: int | None = None,
+    ) -> tuple[str, int]:
+        """GET url. download=True forces a save-as disposition carrying the
+        SANITIZED original filename (never the raw user string, never the
+        storage key — the key leaks the owner id, the name can carry header
+        injection characters that sanitize_filename strips). `expires`
+        overrides the TTL: the GET /files/{id} embed uses the spec's
+        5-minute FILE_URL_EXPIRE_SECONDS, the /url endpoint keeps this
+        default."""
         client = self._presigner()
-        expires = self._settings.PRESIGNED_URL_EXPIRE_SECONDS
+        ttl = (
+            expires if expires is not None else self._settings.PRESIGNED_URL_EXPIRE_SECONDS
+        )
         params: dict[str, Any] = {"Bucket": self._bucket(), "Key": key}
         if download:
-            filename = key.rsplit("/", 1)[-1]
-            params["ResponseContentDisposition"] = (
-                f'attachment; filename="{filename}"'
-            )
+            safe = sanitize_filename(filename or key.rsplit("/", 1)[-1])
+            params["ResponseContentDisposition"] = f'attachment; filename="{safe}"'
         url = await client.generate_presigned_url(
-            "get_object", Params=params, ExpiresIn=expires
+            "get_object", Params=params, ExpiresIn=ttl
         )
-        return url, expires
+        return url, ttl
+
+    async def put_bytes(self, key: str, data: bytes) -> None:
+        """Direct PUT (no presign) — a storage capability, not part of the
+        client upload path: tests use it to plant objects the presigned
+        flow refuses (e.g. a wrong-size body for the size_mismatch branch)."""
+        client = self._require_client()
+        await client.put_object(Bucket=self._bucket(), Key=key, Body=data)
 
     async def head(self, key: str) -> dict[str, Any] | None:
         """Object metadata or None if absent (404 → None, other errors raise)."""
@@ -223,23 +247,27 @@ class StorageService:
         finally:
             resp["Body"].close()
 
-    async def read_head(self, key: str, n: int) -> tuple[bytes, bool]:
-        """First ≤n bytes + whether the object is bigger (sniffing helper)."""
-        head = b""
-        more = False
-        stream = self.read(key)
+    async def read_range(self, key: str, n: int) -> bytes:
+        """First ≤n bytes via a ranged GET (Range header) — the sniff probe.
+
+        A ranged GET stops the transfer at the server: a 25 MB object never
+        leaves S3 just to sample its first 8 KiB. Objects smaller than n
+        return whole (206 or 200). It replaced the v2 read_head helper
+        (full-object GET + stream-abort), which streamed 25 MB to sample
+        bytes and is now gone."""
+        client = self._require_client()
+        resp = await client.get_object(
+            Bucket=self._bucket(), Key=key, Range=f"bytes=0-{n - 1}"
+        )
+        body = b""
         try:
-            async for chunk in stream:
-                if len(head) + len(chunk) > n:
-                    head = (head + chunk)[:n]
-                    more = True
+            async for chunk in resp["Body"]:
+                body += chunk
+                if len(body) >= n:
                     break
-                head += chunk
         finally:
-            # Deterministic cleanup: breaking out of `async for` otherwise
-            # leaves the generator (and its HTTP stream) to the GC.
-            await stream.aclose()
-        return head, more
+            resp["Body"].close()
+        return body[:n]
 
     async def delete(self, key: str) -> None:
         """Idempotent (S3 delete of a missing key succeeds)."""

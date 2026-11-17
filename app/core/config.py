@@ -91,6 +91,15 @@ class Settings(BaseSettings):
 
     # --- uploads ---------------------------------------------------------------
     MAX_UPLOAD_MB: int = 25
+    # pending_upload window: init reserves quota + hands out a presigned PUT;
+    # past this stamp the upload is abandoned (the Phase 6 sweeper reaps the
+    # row and releases the reservation).
+    UPLOAD_TTL_SECONDS: int = 900
+    # The spec's 5-minute presigned GET on GET /files/{id} (separate from the
+    # 15-min PUT window above).
+    FILE_URL_EXPIRE_SECONDS: int = 300
+    # Idempotency-Key replay TTL: retries past it are simply a new upload.
+    IDEMPOTENCY_TTL_DAYS: int = 7
 
     # --- quotas (Phase 5 enforces; set at registration from this knob) --------
     DEFAULT_STORAGE_QUOTA_GB: int = 5

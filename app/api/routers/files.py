@@ -1,8 +1,9 @@
 """Files API: presigned init/complete upload, browse, view, rename, delete.
 
-Every route is Bearer-protected; ownership filtering happens in FileService
-(cross-user ids → 404, never 403). HTTP shapes only — business rules live in
-the service layer.
+Phase 5: Idempotency-Key replay on init (stored 201 body returned verbatim),
+complete returns 202, GET /files/{id} embeds a 5-minute presigned GET.
+Access filtering happens in FileService via AccessService (denials are 404,
+never 403). HTTP shapes only — business rules live in the service layer.
 """
 
 from __future__ import annotations
@@ -10,10 +11,14 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Response, status
+from fastapi import APIRouter, Header, Query, Response, status
+from fastapi.responses import JSONResponse
 
 from app.api.deps import CurrentUser, FilesService
+from app.core.config import get_settings
+from app.core.errors import DomainValidationError
 from app.schemas.files import (
+    FileDetailOut,
     FileInitIn,
     FileInitOut,
     FileOut,
@@ -35,27 +40,45 @@ async def init_upload(
     payload: FileInitIn,
     user: CurrentUser,
     service: FilesService,
-) -> FileInitOut:
-    result = await service.init_upload(
-        user.id, payload.filename, payload.content_type, payload.size
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> FileInitOut | JSONResponse:
+    outcome = await service.init_upload(
+        user.id,
+        payload.filename,
+        payload.content_type,
+        payload.size,
+        folder_id=payload.folder_id,
+        idempotency_key=idempotency_key,
     )
+    if outcome.replay_body is not None:
+        # Stored response, verbatim — same status (201) and body the client
+        # got the first time.
+        return JSONResponse(status_code=status.HTTP_201_CREATED, content=outcome.replay_body)
     return FileInitOut(
-        file_id=result.file.id, upload_url=result.upload_url, expires_in=result.expires_in
+        file_id=outcome.file.id,  # type: ignore[union-attr]
+        upload_url=outcome.upload_url,
+        expires_in=outcome.expires_in,
     )
 
 
 @router.post(
     "/{file_id}/complete",
     response_model=FileOut,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Step 2: verify + hash + sniff the uploaded bytes",
 )
 async def complete_upload(
     file_id: uuid.UUID,
     user: CurrentUser,
     service: FilesService,
+    response: Response,
 ) -> FileOut:
-    file = await service.complete_upload(user.id, file_id)
-    return FileOut.model_validate(file, from_attributes=True)
+    outcome = await service.complete_upload(user.id, file_id)
+    # First complete performs the pending→uploaded transition → 202 Accepted
+    # (the worker finishes it later). A double/replayed complete of an
+    # already-uploaded row is an idempotent no-op → 200 + current state.
+    response.status_code = status.HTTP_202_ACCEPTED if outcome.transitioned else 200
+    return FileOut.model_validate(outcome.file, from_attributes=True)
 
 
 @router.get("", response_model=FilePageOut, summary="All Files (keyset pagination)")
@@ -68,7 +91,6 @@ async def list_files(
     doc_topic: Annotated[str | None, Query()] = None,
     status_filter: Annotated[str | None, Query(alias="status")] = None,
 ) -> FilePageOut:
-    from app.core.errors import DomainValidationError
     from app.db.models import FileKind, FileStatus
 
     try:
@@ -77,9 +99,8 @@ async def list_files(
     except ValueError as exc:
         # Invalid enum query params → 422, never a 500.
         raise DomainValidationError(
-            "Invalid filter value; kind must be one of "
-            "image|pdf|document|text|other, status one of "
-            "uploaded|processing|done|failed.",
+            "Invalid filter value; kind must be one of image|pdf|other, "
+            "status one of pending_upload|uploaded|processing|done|failed.",
             code="bad_filter",
         ) from exc
     page = await service.list_files(
@@ -96,12 +117,23 @@ async def list_files(
     )
 
 
-@router.get("/{file_id}", response_model=FileOut, summary="One file's metadata")
+@router.get("/{file_id}", response_model=FileDetailOut, summary="One file's metadata + view url")
 async def get_file(
     file_id: uuid.UUID, user: CurrentUser, service: FilesService
-) -> FileOut:
-    file = await service.get_file(user.id, file_id)
-    return FileOut.model_validate(file, from_attributes=True)
+) -> FileDetailOut:
+    file, url, expires = await service.get_view_url(
+        user.id,
+        file_id,
+        download=False,
+        # The spec's 5-minute embed TTL; /url keeps the phase-2 knob.
+        expires_seconds=get_settings().FILE_URL_EXPIRE_SECONDS,
+    )
+    detail = FileDetailOut(
+        **FileOut.model_validate(file, from_attributes=True).model_dump(),
+        url=url,
+        url_expires_in=expires,
+    )
+    return detail
 
 
 @router.get(
@@ -131,7 +163,7 @@ async def rename_file(
 @router.delete(
     "/{file_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete file (hard: row + stored object)",
+    summary="Delete file (hard: row + stored object + quota release)",
 )
 async def delete_file(
     file_id: uuid.UUID, user: CurrentUser, service: FilesService

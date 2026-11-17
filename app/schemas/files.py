@@ -1,4 +1,8 @@
-"""Request/response models for the files API."""
+"""Request/response models for the files API (Phase 5 shapes).
+
+FileDetailOut extends FileOut with the 5-minute presigned GET url — additive
+only, the frozen web UI keeps its existing shapes (FileOut/FilePageOut/...).
+"""
 
 from __future__ import annotations
 
@@ -8,8 +12,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-FileKindLiteral = Literal["image", "pdf", "document", "text", "other"]
-FileStatusLiteral = Literal["uploaded", "processing", "done", "failed"]
+# v3 allowlist (Phase 5 sniff): jpeg/png/webp/gif -> image, pdf -> pdf,
+# everything else -> other. document/text were v2 kinds — gone.
+FileKindLiteral = Literal["image", "pdf", "other"]
+FileStatusLiteral = Literal[
+    "pending_upload", "uploaded", "processing", "done", "failed"
+]
 
 
 class FileInitIn(BaseModel):
@@ -17,6 +25,9 @@ class FileInitIn(BaseModel):
     # Advisory only — /complete re-derives the real mime from magic bytes.
     content_type: str = Field(min_length=1, max_length=255)
     size: int = Field(gt=0)  # ≤ MAX_UPLOAD_MB enforced in the service (env-driven)
+    # Absent = the caller's own root ("My Files"); present = editor+ on that
+    # folder, and the upload is charged to the folder OWNER's quota.
+    folder_id: UUID | None = None
 
 
 class FileInitOut(BaseModel):
@@ -37,6 +48,15 @@ class FileOut(BaseModel):
     kind: FileKindLiteral | None
     doc_topic: str | None
     created_at: datetime
+
+
+class FileDetailOut(FileOut):
+    """GET /files/{id}: metadata + a 5-minute presigned GET url. Images
+    render inline; every other kind (and explicit ?download=true) is signed
+    with an attachment disposition carrying the sanitized filename."""
+
+    url: str
+    url_expires_in: int
 
 
 class FileRenameIn(BaseModel):

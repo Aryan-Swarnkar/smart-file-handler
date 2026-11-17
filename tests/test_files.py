@@ -108,7 +108,7 @@ async def test_init_creates_row_and_presigns(client: AsyncClient, db: AsyncSessi
 
     row = await db.get(File, uuid.UUID(body["file_id"]))
     assert row is not None
-    assert row.status.value == "uploaded"
+    assert row.status.value == "pending_upload"  # init registers; complete transitions
     assert row.kind is None
     assert row.sha256 is None  # NULL until complete hashes the bytes
     assert row.storage_key.endswith(".jpg")
@@ -139,7 +139,7 @@ async def test_complete_image_kinds(client: AsyncClient, db: AsyncSession) -> No
         ("anim.webp", WEBP_BYTES, "image/webp"),
     ):
         resp = await _upload(client, headers, filename, data)
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 202, resp.text
         body = resp.json()
         assert body["kind"] == "image"
         assert body["mime_type"] == expected_mime
@@ -151,56 +151,58 @@ async def test_complete_image_kinds(client: AsyncClient, db: AsyncSession) -> No
 async def test_complete_pdf_and_zip_is_other(client: AsyncClient) -> None:
     headers = await _login(client)
     pdf = await _upload(client, headers, "report.pdf", PDF_BYTES)
-    assert pdf.status_code == 200
+    assert pdf.status_code == 202
     assert pdf.json()["kind"] == "pdf"
     assert pdf.json()["mime_type"] == "application/pdf"
 
     # v3 allowlist has no office kinds: ZIP magic (docx) classifies as other,
     # with the single generic fallback mime (no per-kind special-casing).
     docx = await _upload(client, headers, "notes.docx", DOCX_BYTES)
-    assert docx.status_code == 200, docx.text
+    assert docx.status_code == 202, docx.text
     assert docx.json()["kind"] == "other"
     assert docx.json()["mime_type"] == "application/octet-stream"
 
 
 async def test_complete_non_allowlist_kinds_are_other(client: AsyncClient) -> None:
-    """txt/csv have no magic and no pipeline in v3: kind=other → done, browsable."""
+    """txt/csv have no magic and no pipeline in v3: kind=other, browsable.
+    Complete is 202 and everything parks in `uploaded` until the worker
+    (Phase 6) processes it — doc_topic stays NULL until then."""
     headers = await _login(client)
     txt = await _upload(client, headers, "readme.txt", TXT_BYTES)
-    assert txt.status_code == 200
+    assert txt.status_code == 202
     assert txt.json()["kind"] == "other"
     assert txt.json()["mime_type"] == "application/octet-stream"
-    assert txt.json()["status"] == "done"
-    assert txt.json()["doc_topic"] == "other"
+    assert txt.json()["status"] == "uploaded"
+    assert txt.json()["doc_topic"] is None
 
     csv = await _upload(client, headers, "data.csv", CSV_BYTES)
     assert csv.json()["kind"] == "other"
-    assert csv.json()["status"] == "done"
+    assert csv.json()["status"] == "uploaded"
 
 
-async def test_complete_other_binary_is_done_and_browsable(
+async def test_complete_other_binary_is_uploaded_and_browsable(
     client: AsyncClient,
 ) -> None:
-    """Matrix A: .bat → kind=other, doc_topic=other, status=done."""
+    """.bat → kind=other, status=uploaded (the worker finishes it later)."""
     headers = await _login(client)
     resp = await _upload(client, headers, "setup.bat", BAT_BYTES)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["kind"] == "other"
-    assert body["doc_topic"] == "other"
-    assert body["status"] == "done"
+    assert body["doc_topic"] is None
+    assert body["status"] == "uploaded"
 
 
 async def test_sniff_wins_fake_jpg(client: AsyncClient) -> None:
     """An .exe named .jpg must NOT enter the image pipeline (user decision)."""
     headers = await _login(client)
     resp = await _upload(client, headers, "trojan.jpg", FAKE_JPG_BYTES)
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     body = resp.json()
     assert body["kind"] == "other"
     assert body["mime_type"] == "application/octet-stream"
-    assert body["doc_topic"] == "other"
-    assert body["status"] == "done"
+    assert body["doc_topic"] is None
+    assert body["status"] == "uploaded"
 
 
 # --- complete: failure modes ----------------------------------------------------
@@ -219,10 +221,10 @@ async def test_complete_missing_object_409(client: AsyncClient) -> None:
 async def test_complete_is_idempotent(client: AsyncClient) -> None:
     headers = await _login(client)
     first = await _upload(client, headers, "doc.pdf", PDF_BYTES)
-    assert first.status_code == 200
+    assert first.status_code == 202
     file_id = first.json()["id"]
     again = await client.post(f"/files/{file_id}/complete", headers=headers)
-    assert again.status_code == 200
+    assert again.status_code == 200  # double-complete: 200 + current state
     assert again.json()["id"] == file_id
     assert again.json()["sha256"] == first.json()["sha256"]
 
@@ -238,7 +240,7 @@ async def test_pagination_newest_first_with_cursor(client: AsyncClient) -> None:
     ids = []
     for i, data in enumerate(payloads):
         resp = await _upload(client, headers, f"p{i}.txt", data)
-        assert resp.status_code == 200
+        assert resp.status_code == 202
         ids.append(resp.json()["id"])
 
     page1 = await client.get("/files", headers=headers, params={"limit": 2})
@@ -265,9 +267,10 @@ async def test_list_filters(client: AsyncClient) -> None:
     assert all(i["kind"] == "image" for i in images.json()["items"])
     assert len(images.json()["items"]) >= 1
 
-    others = await client.get("/files", headers=headers, params={"doc_topic": "other"})
-    assert all(i["doc_topic"] == "other" for i in others.json()["items"])
-    assert all(i["status"] == "done" for i in others.json()["items"])
+    others = await client.get("/files", headers=headers, params={"kind": "other"})
+    assert others.status_code == 200
+    assert all(i["kind"] == "other" for i in others.json()["items"])
+    assert len(others.json()["items"]) >= 1
 
     bad = await client.get("/files", headers=headers, params={"kind": "nope"})
     assert bad.status_code == 422

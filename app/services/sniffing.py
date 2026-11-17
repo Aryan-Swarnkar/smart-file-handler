@@ -46,6 +46,21 @@ def sanitize_filename(filename: str) -> str:
     return base[:255] or "unnamed"
 
 
+# Markup signatures the allowlist must REJECT at complete (Phase 5): SVG can
+# carry scripted payloads and HTML can phish — they must never become kind=other
+# and re-serve inline. Case-insensitive, whitespace-tolerant probes.
+_MARKUP_PROBES = ("<svg", "<html", "<!doctype html", "<?xml")
+
+
+def is_rejected_markup(head: bytes) -> bool:
+    """True when the sampled bytes look like SVG/HTML markup — the caller
+    rejects the upload (422 rejected_type) instead of storing it. Lowercases
+    a decode-tolerant slice; a binary payload can only match by carrying the
+    literal markup bytes, which is exactly what we are refusing."""
+    probe = head[:256].decode("utf-8", errors="ignore").lower().lstrip()
+    return any(probe.startswith(p) for p in _MARKUP_PROBES)
+
+
 def sniff(filename: str, head: bytes) -> SniffResult:
     """Classify by bytes only — the declared extension is never consulted
     for the allowlist (a .png named .txt is still an image; sniff wins).

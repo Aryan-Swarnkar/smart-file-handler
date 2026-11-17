@@ -20,9 +20,10 @@ from __future__ import annotations
 import hashlib
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import IdempotencyKey
@@ -86,3 +87,16 @@ class IdempotencyRepository:
         self._session.add(row)
         await self._session.flush()
         return row
+
+    async def delete_expired(self) -> int:
+        """Sweeper clause — the model docstring assigns replay-row expiry to
+        Phase 6 (without it the table grows unbounded). Live rows are never
+        touched; a key deleted after its TTL simply means the next init with
+        that header is a brand-new upload, as documented."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                delete(IdempotencyKey).where(IdempotencyKey.expires_at < func.now())
+            ),
+        )
+        return result.rowcount

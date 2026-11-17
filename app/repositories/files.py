@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import base64
 import uuid
-from datetime import datetime
-from typing import NamedTuple
+from datetime import datetime, timedelta
+from typing import Any, NamedTuple, cast
 
-from sqlalchemy import select, text, tuple_
+from sqlalchemy import delete, func, select, text, tuple_, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import File, FileKind, FileStatus
@@ -41,6 +42,22 @@ WITH RECURSIVE chain AS (
 class Page(NamedTuple):
     items: list[File]
     next_cursor: str | None
+
+
+class ExpiredPending(NamedTuple):
+    """Sweeper reap candidate: a pending_upload past its TTL + grace."""
+
+    id: uuid.UUID
+    user_id: uuid.UUID  # the OWNER — uploads charge the folder owner (Phase 5)
+    storage_key: str
+    size_bytes: int
+
+
+class StuckFile(NamedTuple):
+    """Sweeper rescue candidate: uploaded/processing past the threshold."""
+
+    id: uuid.UUID
+    user_id: uuid.UUID
 
 
 def encode_cursor(created_at: datetime, file_id: uuid.UUID) -> str:
@@ -187,3 +204,114 @@ SELECT
         return FolderAccessRow(
             role=role, is_owner=row.is_owner, chain_trashed=row.chain_trashed
         )
+
+    # --- Phase 6: state machine + sweeper ------------------------------------
+    # Every transition is a conditional UPDATE: the rowcount is the race
+    # referee, so at-least-once delivery (duplicate task runs, redelivery
+    # after a worker kill) can never apply a transition twice.
+
+    async def mark_processing(self, file_id: uuid.UUID) -> int:
+        """State-machine step 1: uploaded -> processing. 0 rows = the
+        transition is not ours to make (another delivery already claimed it,
+        or the row is done/failed/pending/deleted)."""
+        claimed = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(File)
+                .where(File.id == file_id, File.status == FileStatus.UPLOADED)
+                .values(status=FileStatus.PROCESSING)
+            ),
+        )
+        return claimed.rowcount
+
+    async def mark_done(self, file_id: uuid.UUID) -> int:
+        """State-machine step 2: processing -> done. Runs in its OWN
+        transaction (the caller commits between the steps): a worker killed
+        between them leaves `processing`, which a redelivery or the
+        sweeper's rescue then finishes. Phase 7 inserts real pipeline work
+        between the steps and must make that work idempotent/claim-guarded
+        (a duplicate delivery can see `processing` mid-flight)."""
+        done = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(File)
+                .where(File.id == file_id, File.status == FileStatus.PROCESSING)
+                .values(status=FileStatus.DONE)
+            ),
+        )
+        return done.rowcount
+
+    async def mark_failed(self, file_id: uuid.UUID, *, message: str) -> int:
+        """Terminal write from the task: NonRetryableError or retry
+        exhaustion. `error` carries a display-safe reason the API surfaces
+        ("format: ...", "network: ..." — never SQL/internal detail). 0 rows
+        = the file vanished mid-flight; nothing to fail."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(File)
+                .where(File.id == file_id)
+                .values(status=FileStatus.FAILED, error=message[:500])
+            ),
+        )
+        return result.rowcount
+
+    async def get_status(self, file_id: uuid.UUID) -> FileStatus | None:
+        return (
+            await self._session.execute(
+                select(File.status).where(File.id == file_id)
+            )
+        ).scalar_one_or_none()
+
+    async def select_stuck(self, *, minutes: int) -> list[StuckFile]:
+        """uploaded/processing rows older than the threshold — the sweeper's
+        rescue candidates. created_at is the clock (the state machine has no
+        interim writes, so age past the threshold means never progressed).
+        Convergence relies on exhausted retries going `failed` (a terminal
+        status leaves this set); otherwise a permanently broken file would
+        be re-enqueued forever."""
+        stmt = select(File.id, File.user_id).where(
+            File.status.in_([FileStatus.UPLOADED, FileStatus.PROCESSING]),
+            File.created_at < func.now() - timedelta(minutes=minutes),
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [StuckFile(id=r.id, user_id=r.user_id) for r in rows]
+
+    async def select_expired_pending(self, *, grace_seconds: int) -> list[ExpiredPending]:
+        """pending_upload rows past upload_expires_at + grace. The cutoff is
+        computed DB-side (now() - interval) so host clock skew never decides
+        lifecycle (AGENTS.md expiry rule)."""
+        stmt = select(
+            File.id, File.user_id, File.storage_key, File.size_bytes
+        ).where(
+            File.status == FileStatus.PENDING_UPLOAD,
+            File.upload_expires_at.is_not(None),
+            File.upload_expires_at < func.now() - timedelta(seconds=grace_seconds),
+        )
+        return [
+            ExpiredPending(
+                id=r.id, user_id=r.user_id, storage_key=r.storage_key, size_bytes=r.size_bytes
+            )
+            for r in (await self._session.execute(stmt)).all()
+        ]
+
+    async def delete_expired_pending(
+        self, file_id: uuid.UUID, *, grace_seconds: int
+    ) -> bool:
+        """Conditional reap: the rowcount is the race referee against a
+        concurrent /complete or /delete (both also predicate on
+        status='pending_upload'). True = we own the row; the caller releases
+        the owner's quota in the SAME transaction. False = someone won the
+        race between the sweeper's object delete and now — the caller logs
+        CRITICAL (its object delete may have hit a file that completed)."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                delete(File).where(
+                    File.id == file_id,
+                    File.status == FileStatus.PENDING_UPLOAD,
+                    File.upload_expires_at < func.now() - timedelta(seconds=grace_seconds),
+                )
+            ),
+        )
+        return result.rowcount == 1

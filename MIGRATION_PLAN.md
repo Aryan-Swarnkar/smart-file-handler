@@ -114,14 +114,15 @@ during the Phase 1 dependency sweep (cheap: read installed package metadata).
 | sqlalchemy[asyncio] / greenlet | keep | MIT |
 | asyncpg | keep | Apache-2.0 ✱ |
 | alembic | keep | MIT |
-| redis | keep | MIT |
+| redis | keep (Phase 6: bumped `>=6.1` — kombu 5.7's redis transport enforces it at runtime, VersionMismatch otherwise; rate-limit usage API-compatible; resolved 8.1.0) | MIT |
 | aioboto3 (+ types-aioboto3) | keep | Apache-2.0 ✱ |
 | argon2-cffi | keep | MIT ✱ |
 | pyjwt | keep | MIT ✱ |
 | email-validator | keep | MIT ✱ |
 | **arq** | **CUT (Phase 1)** | — |
 | **pgvector** | **CUT (Phase 1)** | — |
-| **celery[redis]** | ADD (Phase 6) | BSD-3 |
+| **celery** | ADD (Phase 6) | BSD-3-Clause |
+| **packaging** | ADD (Phase 6) — celery 5.7.0 imports it but declares it nowhere; pinned explicitly | Apache-2.0 / BSD-2-Clause |
 | **Pillow** | ADD (Phase 7) | HPND (permissive) ✱ |
 | **pymupdf** | ADD (Phase 7) | **AGPL-3.0** — acceptable per the user rule (separately-run worker container); flagged |
 | **open_clip** | ADD (Phase 7) | MIT (code); **checkpoint weights' license verified at Phase 7 before any real-model run** |

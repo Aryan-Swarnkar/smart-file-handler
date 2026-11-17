@@ -108,6 +108,30 @@ class Settings(BaseSettings):
     def default_storage_quota_bytes(self) -> int:
         return self.DEFAULT_STORAGE_QUOTA_GB * 1024 * 1024 * 1024
 
+    # --- Phase 6 pipeline: relay + Celery + sweeper -----------------------------
+    # Relay: one claim cycle per poll; RELAY_BATCH_SIZE rows per claim. No
+    # attempts cap on purpose: the only realistic send failure is broker
+    # downtime, and a cap would strand every unpublished row after a long
+    # outage — per-row send isolation plus escalating log severity instead.
+    RELAY_POLL_SECONDS: float = 2.0
+    RELAY_BATCH_SIZE: int = 20
+    # Task limits: soft (raises inside the task, retryable) < hard (kills the
+    # worker process; acks_late + reject_on_worker_lost turn that into a
+    # redelivery) < broker visibility timeout (a running task must never be
+    # redelivered mid-flight).
+    TASK_SOFT_TIME_LIMIT: int = 90
+    TASK_HARD_TIME_LIMIT: int = 120
+    BROKER_VISIBILITY_TIMEOUT: int = 300
+    # Retryable failures: exponential backoff + jitter; the LAST attempt
+    # writes files.status='failed' + files.error (the reason), otherwise the
+    # row would loop through the sweeper's rescue forever.
+    CELERY_TASK_MAX_RETRIES: int = 5
+    # Sweeper cadence + thresholds. Every expiry/stuck comparison runs in SQL
+    # against now() — host clock skew never decides lifecycle.
+    SWEEP_INTERVAL_SECONDS: int = 60
+    STUCK_FILE_MINUTES: int = 10
+    PENDING_SWEEP_GRACE_SECONDS: int = 60
+
     # --- ClamAV (scan pipeline, Phase 7) -----------------------------------------
     CLAMAV_HOST: str = "localhost"
     CLAMAV_PORT: int = 3310

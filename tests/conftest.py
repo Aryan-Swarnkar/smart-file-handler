@@ -32,9 +32,13 @@ from collections.abc import AsyncGenerator, Generator
 import pytest
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.main import create_app
+from app.workers.pause import PIPELINE_PAUSE_LOCK_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +66,39 @@ async def _flush_rate_limits() -> AsyncGenerator[None, None]:
         yield
     finally:
         await redis.aclose()
+
+
+@pytest.fixture(autouse=True)
+async def _pause_dev_pipeline() -> AsyncGenerator[None, None]:
+    """Hold the pipeline-pause advisory lock for the duration of each test.
+
+    pytest runs against the LIVE dev stack (relay + worker containers poll
+    this same database). Without the pause, the relay claims and stamps this
+    suite's outbox rows mid-assertion and the worker flips test files to
+    `done` behind the API's back — every status assertion after a complete
+    becomes a race. Holding the lock makes the suite deterministic; the
+    relay drains everything the moment the test releases it (app/workers/
+    pause.py — the same lock is a legitimate operator maintenance knob).
+    """
+    engine = create_async_engine(get_settings().DATABASE_URL, poolclass=NullPool)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as session:
+        # pg_advisory_lock returns VOID and BLOCKS until acquired — returning
+        # IS the acquisition (only the _try_ variant returns a bool).
+        await session.execute(
+            text("SELECT pg_advisory_lock(:key)"), {"key": PIPELINE_PAUSE_LOCK_KEY}
+        )
+        try:
+            yield
+        finally:
+            released = (
+                await session.execute(
+                    text("SELECT pg_advisory_unlock(:key)"),
+                    {"key": PIPELINE_PAUSE_LOCK_KEY},
+                )
+            ).scalar_one()
+            assert released is True, "pause lock must have been held by this test"
+    await engine.dispose()
 
 
 @pytest.fixture

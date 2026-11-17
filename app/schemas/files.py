@@ -47,6 +47,10 @@ class FileOut(BaseModel):
     status: FileStatusLiteral
     kind: FileKindLiteral | None
     doc_topic: str | None
+    # Phase 6: worker-written terminal reason ("processing failed after N
+    # attempts: ...", "format: ...") — NULL while the file is alive. Additive
+    # response field (frozen web UI keeps working; extra keys are ignored).
+    error: str | None
     created_at: datetime
 
 

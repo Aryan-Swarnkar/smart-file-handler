@@ -18,8 +18,16 @@ dependencies = [
     "asyncpg>=0.30",
     "greenlet>=3.1",
     "alembic>=1.13",
-    # --- cache (rate limiting; Celery broker arrives Phase 6) ---
-    "redis>=5.1",
+    # --- cache (rate limiting) ---
+    # kombu 5.7's redis transport enforces redis-py >= 6.1 at runtime
+    # (VersionMismatch crash otherwise); rate-limit usage is API-compatible.
+    "redis>=6.1",
+    # --- pipeline (Phase 6) ---
+    # celery 5.7.0 imports packaging at worker/beat startup and in send_task,
+    # but declares it nowhere (verified via importlib.metadata) — pinned
+    # explicitly so container images get it too.
+    "celery>=5.4",
+    "packaging>=24",
     # --- object storage (P3) ---
     "aioboto3>=13.2",
     # --- security (P2) ---

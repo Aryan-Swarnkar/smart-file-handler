@@ -125,12 +125,21 @@ services:
         condition: service_healthy
 
   worker:
-    # Phase 1 placeholder: boots and stays up so compose health is testable.
-    # Celery tasks land in Phase 6, scan/label pipelines in Phase 7. Same
+    # Celery worker: process_file state machine (Phase 6), scan/label
+    # pipelines in Phase 7. Concurrency 1 for the ML worker (spec). Same
     # image, the Dockerfile's `worker` target.
     build:
       context: .
       target: worker
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app:celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+      ]
     restart: unless-stopped
     environment:
       ENV: ${ENV:-development}
@@ -159,17 +168,49 @@ services:
       clamav:
         condition: service_started
 
-  relay:
-    # Outbox -> Celery relay (Phase 6). Placeholder until then: the container
-    # must exist and stay up so compose health is testable.
+  beat:
+    # Celery beat: schedules the periodic sweep (Phase 6). Separate container
+    # so sweep scheduling has its own failure domain — relay down must not
+    # stop sweeps, worker down must not stop scheduling.
     build:
       context: .
       target: worker
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app:celery_app",
+        "beat",
+        "--loglevel=INFO",
+      ]
     restart: unless-stopped
     environment:
       ENV: ${ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-smart_file_handler}
+      REDIS_URL: redis://redis:6379/0
+      SWEEP_INTERVAL_SECONDS: ${SWEEP_INTERVAL_SECONDS:-60}
+    mem_limit: 256m
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  relay:
+    # Outbox -> Celery relay (Phase 6): the single publisher from DB state to
+    # the broker. The API never enqueues; the sweeper re-enqueues via outbox
+    # rows. Python loop process (`python -m app.workers.relay`).
+    build:
+      context: .
+      target: worker
+    command: ["python", "-m", "app.workers.relay"]
+    restart: unless-stopped
+    environment:
+      ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      SECRET_KEY: ${SECRET_KEY}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-smart_file_handler}
       REDIS_URL: redis://redis:6379/0
     mem_limit: 256m

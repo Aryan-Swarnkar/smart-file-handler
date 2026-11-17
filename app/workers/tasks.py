@@ -1,15 +1,15 @@
-"""Celery tasks: process_file drives ONLY the state machine (Phase 6).
+"""Celery tasks: process_file = state machine + real pipelines (Phase 7).
 
 Invariants (from the spec + AGENTS.md):
 - Conditional transitions (`UPDATE ... WHERE status = ...`): the rowcount is
   the race referee, so duplicate deliveries are no-ops and at-least-once
   delivery is safe.
-- Two SEPARATE transactions (uploaded->processing, then processing->done)
-  mirror the Phase 7 shape, where real pipeline work runs between them: a
-  worker killed between the steps leaves `processing`, which a redelivery
-  or the sweeper's rescue re-enqueue then finishes. NOTE for Phase 7: with
-  real work between the steps, a duplicate delivery can observe
-  `processing` mid-flight — the work must be idempotent or claim-guarded.
+- Two SEPARATE transactions: step 1 claims uploaded->processing and reads
+  the pipeline inputs; the PIPELINE (download+hash, ClamAV scan, kind
+  dispatch) runs with NO transaction held; step 2 marks processing->done.
+  A worker killed between the steps leaves `processing`, which a redelivery
+  or the sweeper's rescue re-enqueue then finishes (the pipeline is
+  idempotent, so the finishing delivery simply redoes the work).
 - Engine PER task invocation (NullPool), created inside the task body and
   disposed in `finally`: workers are forked processes and must never share
   the API's engine/pool (AGENTS.md rule 8).
@@ -18,13 +18,18 @@ Invariants (from the spec + AGENTS.md):
   Retryable errors retry with exponential backoff + jitter; the LAST
   attempt also lands in `failed`, otherwise a permanently broken file would
   loop through the sweeper's rescue forever.
+- An infected verdict quarantines in ONE transaction: processing->
+  quarantined, quota released, and the storage.delete outbox row (the relay
+  then removes the object; the API never touches Celery — rule 4).
 """
 
 from __future__ import annotations
 
 import asyncio
 import random
+import tempfile
 import uuid
+from pathlib import Path
 from typing import Any, Protocol
 
 from sqlalchemy.ext.asyncio import (
@@ -37,25 +42,24 @@ from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.db.models import FileStatus
-from app.repositories.files import FileRepository
+from app.db.models import FileKind, FileStatus
+from app.repositories.files import FileFacts, FileRepository
+from app.repositories.outbox import OutboxRepository
+from app.repositories.quota import QuotaRepository
+from app.services.storage_service import StorageService
 from app.workers.celery_app import celery_app
+from app.workers.errors import NonRetryableError  # re-exported for tests/FI:
+
+# tasks_module.NonRetryableError stays the task-facing name; pipelines
+# import the same class from app.workers.errors (no import cycle).
+from app.workers.pipelines import image_pipeline, pdf_pipeline
+from app.workers.pipelines.scan import assert_scannable_size, scan_file
 
 logger = get_logger(__name__)
 
 # files.error is a display column (surfaced by the API) — hard-cap the
 # reason written to it.
 MAX_ERROR_LENGTH = 500
-
-
-class NonRetryableError(Exception):
-    """Terminal, deterministic failure — retrying cannot succeed (bad kind,
-    corrupt object, unsupported payload). `reason` is display-safe text the
-    API surfaces via files.error; never embed SQL or internals in it."""
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
 
 
 class _RequestLike(Protocol):
@@ -84,21 +88,23 @@ def _retry_countdown(retries: int) -> float:
 
 
 async def _drive_state_machine(file_id: uuid.UUID) -> None:
-    """uploaded -> processing -> done, two conditional steps in two
-    transactions. Duplicate deliveries no-op at whichever step no longer
-    applies; a delivery that finds `processing` FINISHES it (the delivery
-    that claimed step 1 may have died before step 2). A missing row or a
-    non-participating status is a graceful no-op — stale events must never
-    resurrect or fail rows."""
+    """uploaded -> processing -> [pipeline] -> done. Duplicate deliveries
+    no-op at whichever step no longer applies; a delivery that finds
+    `processing` FINISHES it (the delivery that claimed step 1 may have died
+    mid-pipeline — the pipeline is idempotent, so redoing it is safe). A
+    missing row or a non-participating status is a graceful no-op — stale
+    events must never resurrect or fail rows."""
     engine = _build_engine()
     try:
         factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        # Step 1: uploaded -> processing, and read the pipeline inputs, in
+        # ONE transaction. 0 rows = not ours to claim (or the kill seam).
         async with factory() as session:
             repo = FileRepository(session)
-
-            # Step 1: uploaded -> processing. 0 rows = not ours to claim.
             claimed = await repo.mark_processing(file_id)
             if claimed:
+                facts = await repo.get_facts(file_id)
                 await session.commit()  # step 1 committed — the kill seam
             else:
                 status = await repo.get_status(file_id)
@@ -110,16 +116,29 @@ async def _drive_state_machine(file_id: uuid.UUID) -> None:
                         "process_file_noop", file_id=str(file_id), status=status.value
                     )
                     return
-                await session.rollback()  # end the read tx before step 2
+                # Kill seam: a previous delivery claimed step 1 and died
+                # mid-pipeline. Its facts are still valid — finish the work.
+                facts = await repo.get_facts(file_id)
+                await session.rollback()  # end the read tx before the pipeline
+            if facts is None:
+                # Claimed, then the row vanished (concurrent delete): the
+                # claim is moot — nothing exists to process or fail.
+                logger.warning("process_file_facts_missing", file_id=str(file_id))
+                return
 
-            # Step 2: processing -> done (own tx — the kill-recovery seam).
-            done = await repo.mark_done(file_id)
+        # Pipeline (NO transaction held — short sessions only):
+        # download+hash -> size guard -> ClamAV scan -> kind dispatch.
+        await _run_pipeline(factory, file_id, facts)
+
+        # Step 2: processing -> done (own tx — the kill-recovery seam).
+        async with factory() as session:
+            done = await FileRepository(session).mark_done(file_id)
             if done:
                 await session.commit()
                 logger.info("file_processed", file_id=str(file_id))
             else:
                 await session.rollback()
-                status = await repo.get_status(file_id)
+                status = await FileRepository(session).get_status(file_id)
                 logger.info(
                     "process_file_step2_noop",
                     file_id=str(file_id),
@@ -127,6 +146,112 @@ async def _drive_state_machine(file_id: uuid.UUID) -> None:
                 )
     finally:
         await engine.dispose()
+
+
+async def _run_pipeline(
+    factory: async_sessionmaker[AsyncSession],
+    file_id: uuid.UUID,
+    facts: FileFacts,
+) -> None:
+    """Download + hash, size guard, ClamAV scan, kind dispatch. Raises
+    NonRetryableError for deterministic failures; ScanUnavailable (clamd
+    unreachable / unclean answer) propagates as RETRYABLE. An infected
+    verdict short-circuits via _quarantine and this function returns."""
+    with tempfile.TemporaryDirectory(prefix="sfh-task-") as tmp:
+        path = Path(tmp) / "object.bin"
+        storage = StorageService()
+        await storage.start()
+        try:
+            digest = await storage.download_to_path(facts.storage_key, path)
+        finally:
+            await storage.close()
+        if digest is None:
+            raise NonRetryableError("storage: object missing")
+        # Integrity: /complete already stored the real hash — a mismatch
+        # means the bytes changed under us (deterministic, never quarantined).
+        if facts.sha256 is not None and digest != facts.sha256:
+            raise NonRetryableError("integrity: sha256 mismatch")
+
+        assert_scannable_size(facts.size_bytes)
+        # ScanUnavailable propagates as RETRYABLE (never mark clean on a
+        # maybe); every other scan failure is deterministic.
+        verdict = await scan_file(path)
+        if verdict.infected:
+            await _quarantine(
+                factory,
+                file_id,
+                user_id=facts.user_id,
+                size_bytes=facts.size_bytes,
+                storage_key=facts.storage_key,
+            )
+            return
+
+        match facts.kind:
+            case FileKind.IMAGE:
+                await image_pipeline.run_image_pipeline(
+                    factory, file_id=file_id, user_id=facts.user_id, path=path
+                )
+            case FileKind.PDF:
+                await pdf_pipeline.run_pdf_pipeline(
+                    factory, file_id=file_id, user_id=facts.user_id, path=path
+                )
+            case _:
+                # other (and legacy kind-NULL rows): scan-only.
+                logger.info(
+                    "pipeline_scan_only",
+                    file_id=str(file_id),
+                    kind=facts.kind.value if facts.kind is not None else None,
+                )
+
+
+async def _quarantine(
+    factory: async_sessionmaker[AsyncSession],
+    file_id: uuid.UUID,
+    *,
+    user_id: uuid.UUID,
+    size_bytes: int,
+    storage_key: str,
+) -> None:
+    """Infected verdict -> quarantine in ONE transaction: the conditional
+    processing->quarantined UPDATE (rowcount = race referee), the owner's
+    quota release, and the storage.delete outbox row (relay removes the
+    object; the object itself is never touched inside the DB tx). A lost
+    race (the row moved elsewhere meanwhile) writes nothing — the winner
+    owns the outcome."""
+    async with factory() as session:
+        moved = await FileRepository(session).mark_quarantined(file_id)
+        if not moved:
+            await session.rollback()
+            logger.warning("process_file_quarantine_lost_race", file_id=str(file_id))
+            return
+        released = await QuotaRepository(session).release(user_id, size_bytes)
+        if not released:
+            # Defensive (accounting must never drift): the reservation should
+            # still hold. Mirror the sweeper's guarded-release log.
+            logger.warning(
+                "process_file_quota_release_guarded",
+                file_id=str(file_id),
+                user_id=str(user_id),
+                size_bytes=size_bytes,
+            )
+        await OutboxRepository(session).insert_event(
+            event_type="storage.delete",
+            payload={"storage_key": storage_key, "file_id": str(file_id)},
+        )
+        await session.commit()
+    logger.warning(
+        "file_quarantined", file_id=str(file_id), storage_key=storage_key
+    )
+
+
+async def _delete_object(storage_key: str) -> None:
+    """Idempotent object removal (S3 delete of a missing key succeeds)."""
+    storage = StorageService()
+    await storage.start()
+    try:
+        await storage.delete(storage_key)
+    finally:
+        await storage.close()
 
 
 async def _mark_failed(file_id: uuid.UUID, reason: str) -> None:
@@ -214,7 +339,21 @@ def _process_file_body(task: _TaskLike, file_id: str) -> None:
     max_retries=get_settings().CELERY_TASK_MAX_RETRIES,
 )
 def process_file(self: Any, file_id: str) -> None:
-    """Drive ONLY the state machine for one file. The relay queues it for
-    `file.uploaded` and `file.reprocess`; scan/label/text pipelines hook in
-    between the two transitions in Phase 7."""
+    """Drive one file through claim -> pipeline (download+hash, ClamAV scan,
+    kind pipelines) -> done. The relay queues it for `file.uploaded` and
+    `file.reprocess`."""
     _process_file_body(self, file_id)
+
+
+@celery_app.task(name="delete_object")
+def delete_object(storage_key: str) -> None:
+    """Remove one storage object — the worker side of `storage.delete`
+    outbox rows (quarantine, and Phase 10's batched deletes). Idempotent:
+    a missing object is a no-op, so duplicate deliveries are harmless."""
+    if not isinstance(storage_key, str) or not storage_key:
+        # Poison message last-line defense: the relay dead-letters malformed
+        # payloads before they get here; log loudly and stop.
+        logger.error("delete_object_bad_storage_key", key=str(storage_key)[:100])
+        return
+    asyncio.run(_delete_object(storage_key))
+    logger.info("object_deleted", storage_key=storage_key)

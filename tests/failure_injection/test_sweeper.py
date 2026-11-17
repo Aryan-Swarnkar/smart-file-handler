@@ -29,6 +29,7 @@ from tests.failure_injection.conftest import (
     make_factory,
     seed_file,
     seed_user_with_quota,
+    tiny_png,
 )
 
 
@@ -247,7 +248,10 @@ async def test_stuck_rescue_writes_exactly_one_reprocess(db: AsyncSession) -> No
 
 async def test_rescue_flows_through_relay_to_done(db: AsyncSession) -> None:
     user = await seed_user_with_quota(db)
-    file = await seed_file(db, user, status=FileStatus.UPLOADED)
+    # Phase 7: the finishing delivery runs the real pipeline — real bytes.
+    file = await seed_file(
+        db, user, status=FileStatus.UPLOADED, plant_object=True, data=tiny_png()
+    )
     await db.commit()
 
     await age_created_at(db, file.id, 30)

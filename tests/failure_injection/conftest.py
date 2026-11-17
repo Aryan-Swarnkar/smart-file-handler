@@ -1,18 +1,26 @@
-"""Shared fixtures + seeds for the Phase 6 failure-injection suite.
+"""Shared fixtures + seeds for the Phase 6/7 failure-injection suite.
 
 Real Postgres + real SeaweedFS (same harness as every other suite — the dev
 DB on :5433, bucket on :9000; users are hermetic via unique emails). The
 celery BROKER is never started here: state-machine and sweep logic is driven
 through the async internals, and the task body runs in a helper THREAD so
 its internal asyncio.run() has no running loop to collide with pytest's.
+
+Phase 7: `_drive_state_machine` now runs the REAL pipeline between the two
+transitions, so tests that reach it must plant REAL bytes for the row's
+kind (TINY_PNG decodes, TINY_PDF parses, EICAR_TEXT trips the scan stub).
+Stale/no-op paths return before the pipeline and need no objects.
 """
 
 from __future__ import annotations
 
+import hashlib
+import io
 import threading
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from typing import Any
 
 import pytest
@@ -23,6 +31,36 @@ from sqlalchemy.pool import NullPool
 from app.core.config import get_settings
 from app.db.models import File, FileKind, FileStatus, Outbox, User
 from app.services.storage_service import StorageService
+from app.workers.pipelines.scan import EICAR_SIGNATURE
+
+
+@lru_cache(maxsize=1)
+def tiny_png() -> bytes:
+    """A REAL 1x1 PNG (Pillow-built once per session): header-parseable by
+    the image pipeline's bomb guard, stub-mode labelable, tiny."""
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (1, 1), (200, 30, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@lru_cache(maxsize=1)
+def tiny_pdf() -> bytes:
+    """A REAL minimal PDF carrying extractable text (PyMuPDF-built)."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Quarterly finance report total 1250 EUR")
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+# Scan-stub bait: plain text whose bytes contain the EICAR test string.
+EICAR_TEXT = (EICAR_SIGNATURE + "\n").encode("ascii")
+PLAIN_TEXT = b"plain text file, nothing to see here"
 
 
 @pytest.fixture(autouse=True)
@@ -84,24 +122,39 @@ async def seed_file(
     user: User,
     *,
     status: FileStatus = FileStatus.UPLOADED,
-    size_bytes: int = 100,
+    size_bytes: int | None = None,
     kind: FileKind | None = FileKind.IMAGE,
     upload_expires_at: datetime | None = None,
     plant_object: bool = False,
+    data: bytes | None = None,
+    name: str | None = None,
+    mime: str | None = None,
 ) -> File:
-    """One file row (and optionally the real storage object behind it)."""
+    """One file row (and optionally the real storage object behind it).
+
+    `data` plants REAL bytes and mirrors the /complete flow: sha256 is
+    stored (the pipeline's integrity check runs against it) and size
+    defaults to len(data). Without data the legacy JPEG-magic stub bytes
+    keep old tests byte-identical. `name`/`mime` matter to the pipelines
+    only via the row's `kind` (dispatch) — they label the row for the
+    listing."""
+    file_name = name or "fi-file.jpg"
     fid = uuid.uuid4()
-    storage_key = f"{user.id}/{fid}.jpg"
+    suffix = file_name.rsplit(".", 1)[-1]
+    storage_key = f"{user.id}/{fid}.{suffix}"
+    if size_bytes is None:
+        size_bytes = len(data) if data is not None else 100
     file = File(
         id=fid,
         user_id=user.id,
-        original_name="fi-file.jpg",
-        mime_type="image/jpeg",
+        original_name=file_name,
+        mime_type=mime or "image/jpeg",
         size_bytes=size_bytes,
         storage_key=storage_key,
         status=status,
         kind=kind,
         upload_expires_at=upload_expires_at,
+        sha256=hashlib.sha256(data).hexdigest() if data is not None else None,
     )
     db.add(file)
     await db.flush()
@@ -109,9 +162,12 @@ async def seed_file(
         storage = StorageService()
         await storage.start()
         try:
-            await storage.put_bytes(
-                storage_key, b"\xff\xd8\xff\xe0" + b"\x00" * max(size_bytes - 4, 0)
+            body = (
+                data
+                if data is not None
+                else b"\xff\xd8\xff\xe0" + b"\x00" * max(size_bytes - 4, 0)
             )
+            await storage.put_bytes(storage_key, body)
         finally:
             await storage.close()
     return file
@@ -123,8 +179,12 @@ async def seed_outbox_event(
     event_type: str = "file.uploaded",
     file_id: uuid.UUID | None = None,
     published: bool = False,
+    payload: dict[str, Any] | None = None,
 ) -> Outbox:
-    row = Outbox(event_type=event_type, payload={"file_id": str(file_id or uuid.uuid4())})
+    row = Outbox(
+        event_type=event_type,
+        payload=payload if payload is not None else {"file_id": str(file_id or uuid.uuid4())},
+    )
     if published:
         row.published_at = datetime.now(UTC)
     db.add(row)
@@ -174,15 +234,20 @@ class FakeTask:
 
 
 class FakeBroker:
-    """Records send_task calls; optional permanent failure injection."""
+    """Records send_task calls; optional permanent failure injection.
+    `sent` stays (task, file_id) for the file-event assertions;
+    `sent_kwargs` records the full kwargs (storage.delete carries a
+    storage_key, not a file_id)."""
 
     def __init__(self, fail: Exception | None = None) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.sent_kwargs: list[tuple[str, dict[str, str]]] = []
         self.fail = fail
 
     def send_task(self, name: str, kwargs: dict[str, str] | None = None) -> None:
         if self.fail is not None:
             raise self.fail
+        self.sent_kwargs.append((name, dict(kwargs or {})))
         self.sent.append((name, (kwargs or {}).get("file_id", "")))
 
 

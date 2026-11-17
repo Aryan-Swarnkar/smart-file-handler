@@ -368,6 +368,13 @@ class FileService:
         file = await self._files.get_fresh(file_id)
         if file is None:
             raise NotFoundError("File not found.")
+        # Quarantined files are invisible to reads (the object is gone or
+        # going): detail AND presigned views 404, exactly like a missing
+        # row. The listing still shows the row (the user must see why their
+        # quota dropped / that the file was flagged); rename and delete
+        # stay available (delete_file re-checks via get_fresh below).
+        if file.status is FileStatus.QUARANTINED:
+            raise NotFoundError("File not found.")
         await self._access.require_role(actor_id, file, AccessRole.VIEWER)
         return file
 
@@ -415,7 +422,11 @@ class FileService:
         # Release the reservation (completed files charge used bytes; pending
         # rows hold their init reservation). A failed complete already
         # released AND zeroed size_bytes → this is a 0-byte no-op for them.
-        await self._quota.release(file.user_id, file.size_bytes)
+        # Quarantined rows were released by the quarantine transaction —
+        # releasing again here would hand the user free space (guarded
+        # release cannot go negative, but accounting would drift).
+        if file.status is not FileStatus.QUARANTINED:
+            await self._quota.release(file.user_id, file.size_bytes)
         await self._files.delete(file)
         await self._session.commit()
         logger.info(

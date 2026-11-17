@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # everything else -> other. document/text were v2 kinds — gone.
 FileKindLiteral = Literal["image", "pdf", "other"]
 FileStatusLiteral = Literal[
-    "pending_upload", "uploaded", "processing", "done", "failed"
+    "pending_upload", "uploaded", "processing", "done", "failed", "quarantined"
 ]
 
 

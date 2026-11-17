@@ -49,13 +49,36 @@ from app.workers.pause import pipeline_clear
 
 logger = get_logger(__name__)
 
-# The relay's whole task-mapping table. New event types (Phase 7 pipeline
-# stages, Phase 10 storage deletes) extend it; anything unmapped is
-# dead-lettered, never silently dropped.
-EVENT_TO_TASK: dict[str, str] = {
-    "file.uploaded": "process_file",
-    "file.reprocess": "process_file",
-}
+# The relay's task-mapping. `file.*` events carry file_id (the state
+# machine re-derives everything else from the row); `storage.delete` carries
+# the storage_key itself (Phase 7 quarantine; Phase 10 batched deletes).
+# Anything unmapped, or a payload missing its key, is dead-lettered by log —
+# never silently dropped, never churned forever.
+FILE_EVENTS: tuple[str, ...] = ("file.uploaded", "file.reprocess")
+
+
+def _build_send(claim: OutboxClaim) -> tuple[str, dict[str, str]] | None:
+    """event_type + payload -> (task_name, kwargs); None = dead-letter by
+    log (stamped published, ERROR logged, payload kept for forensics)."""
+    payload = claim.payload if isinstance(claim.payload, dict) else {}
+    if claim.event_type in FILE_EVENTS:
+        file_id = payload.get("file_id")
+        if isinstance(file_id, str) and file_id:
+            return "process_file", {"file_id": file_id}
+        logger.error(
+            "relay_malformed_payload", outbox_id=claim.id, event_type=claim.event_type
+        )
+        return None
+    if claim.event_type == "storage.delete":
+        storage_key = payload.get("storage_key")
+        if isinstance(storage_key, str) and storage_key:
+            return "delete_object", {"storage_key": storage_key}
+        logger.error(
+            "relay_malformed_payload", outbox_id=claim.id, event_type=claim.event_type
+        )
+        return None
+    logger.error("relay_unknown_event_type", outbox_id=claim.id, event_type=claim.event_type)
+    return None
 
 
 def _log_send_failure(claim: OutboxClaim, exc: Exception) -> None:
@@ -86,28 +109,14 @@ async def _cycle(engine: AsyncEngine, broker: Celery) -> int:
 
     published_ids: list[int] = []
     for claim in claims:
-        task_name = EVENT_TO_TASK.get(claim.event_type)
-        if task_name is None:
-            logger.error(
-                "relay_unknown_event_type",
-                outbox_id=claim.id,
-                event_type=claim.event_type,
-            )
+        send = _build_send(claim)
+        if send is None:
             published_ids.append(claim.id)  # dead-letter by log: stop the churn
             continue
-        try:
-            file_id = str(claim.payload["file_id"])
-        except (KeyError, TypeError):
-            logger.error(
-                "relay_malformed_payload",
-                outbox_id=claim.id,
-                event_type=claim.event_type,
-            )
-            published_ids.append(claim.id)
-            continue
+        task_name, kwargs = send
         try:
             # 2. kombu is synchronous — never block the loop on it.
-            await asyncio.to_thread(broker.send_task, task_name, kwargs={"file_id": file_id})
+            await asyncio.to_thread(broker.send_task, task_name, kwargs=kwargs)
         except Exception as exc:
             _log_send_failure(claim, exc)
             break  # broker down: the rest of the batch would fail identically

@@ -135,12 +135,30 @@ class Settings(BaseSettings):
     # --- ClamAV (scan pipeline, Phase 7) -----------------------------------------
     CLAMAV_HOST: str = "localhost"
     CLAMAV_PORT: int = 3310
+    # Connection + stream timeouts: unreachable/slow clamd is RETRYABLE, so
+    # these bound how long one attempt may hang (soft/hard task limits stay
+    # the outer fence).
+    CLAMAV_CONNECT_TIMEOUT: float = 5.0
+    CLAMAV_TIMEOUT: float = 30.0
+    # clamd's INSTREAM MaxStreamSize is a server cap (compose: StreamMaxLength).
+    # Guard BEFORE streaming: a bigger object is deterministically unscannable.
+    CLAMAV_STREAM_MAX_BYTES: int = 50 * 1024 * 1024
 
     # --- ML pipeline (Phase 7) -----------------------------------------------
     # ML_STUB=1: workers use fixed-delay fakes returning deterministic labels
     # instead of real models. Real models only on explicit ask, never alongside
     # the full stack + Locust (16 GB host).
     ML_STUB: bool = True
+    # Decompression-bomb guard (image pipeline): declared pixels above this are
+    # rejected BEFORE any decode (checked on the header probe; also set as
+    # Pillow's own MAX_IMAGE_PIXELS so a decode that slips past the probe dies
+    # in the library guard).
+    MAX_IMAGE_PIXELS: int = 30_000_000
+    # CLIP zero-shot labels below this softmax confidence are dropped.
+    LABEL_CONFIDENCE_THRESHOLD: float = 0.20
+    # PDF text cap: keeps the GENERATED tsvector under PG's 1 MB limit and the
+    # row small; extraction stops early once the cap is reached.
+    PDF_TEXT_CHAR_CAP: int = 200_000
 
     # --- HTTP -------------------------------------------------------------------
     # Comma-separated origins; empty string disables CORS middleware.

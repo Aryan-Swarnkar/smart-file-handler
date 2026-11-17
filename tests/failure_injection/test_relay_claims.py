@@ -25,6 +25,7 @@ from tests.failure_injection.conftest import (
     seed_file,
     seed_outbox_event,
     seed_user_with_quota,
+    tiny_png,
 )
 
 
@@ -78,7 +79,10 @@ async def test_crash_between_send_and_stamp_republishes_safely(
     db: AsyncSession,
 ) -> None:
     user = await seed_user_with_quota(db)
-    file = await seed_file(db, user, status=FileStatus.UPLOADED)
+    # Phase 7: both deliveries run the real pipeline — real bytes required.
+    file = await seed_file(
+        db, user, status=FileStatus.UPLOADED, plant_object=True, data=tiny_png()
+    )
     row = await seed_outbox_event(db, event_type="file.uploaded", file_id=file.id)
     await db.commit()
 

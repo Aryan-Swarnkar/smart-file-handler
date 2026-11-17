@@ -60,6 +60,18 @@ class StuckFile(NamedTuple):
     user_id: uuid.UUID
 
 
+class FileFacts(NamedTuple):
+    """Pipeline inputs read right after the step-1 claim (one scalar read,
+    no ORM entity): kind decides dispatch, storage_key/user_id drive storage
+    + per-user labels, sha256/size_bytes drive integrity + scan guards."""
+
+    kind: FileKind | None
+    storage_key: str
+    user_id: uuid.UUID
+    sha256: str | None
+    size_bytes: int
+
+
 def encode_cursor(created_at: datetime, file_id: uuid.UUID) -> str:
     raw = f"{created_at.isoformat()}|{file_id}"
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
@@ -224,6 +236,30 @@ SELECT
         )
         return claimed.rowcount
 
+    async def get_facts(self, file_id: uuid.UUID) -> FileFacts | None:
+        """The columns the pipeline needs, one read (scalar tuple, no ORM
+        entity). None = the row vanished mid-flight (a concurrent delete)."""
+        row = (
+            await self._session.execute(
+                select(
+                    File.kind,
+                    File.storage_key,
+                    File.user_id,
+                    File.sha256,
+                    File.size_bytes,
+                ).where(File.id == file_id)
+            )
+        ).first()
+        if row is None:
+            return None
+        return FileFacts(
+            kind=row.kind,
+            storage_key=row.storage_key,
+            user_id=row.user_id,
+            sha256=row.sha256,
+            size_bytes=row.size_bytes,
+        )
+
     async def mark_done(self, file_id: uuid.UUID) -> int:
         """State-machine step 2: processing -> done. Runs in its OWN
         transaction (the caller commits between the steps): a worker killed
@@ -252,6 +288,39 @@ SELECT
                 update(File)
                 .where(File.id == file_id)
                 .values(status=FileStatus.FAILED, error=message[:500])
+            ),
+        )
+        return result.rowcount
+
+    async def mark_quarantined(self, file_id: uuid.UUID) -> int:
+        """Scan verdict infected: processing -> quarantined, CONDITIONAL on
+        processing (the rowcount referees against a concurrent delete/
+        state move — the caller releases quota + writes the storage.delete
+        outbox row only when this transition is ours)."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(File)
+                .where(File.id == file_id, File.status == FileStatus.PROCESSING)
+                .values(status=FileStatus.QUARANTINED)
+            ),
+        )
+        return result.rowcount
+
+    async def set_pdf_text(
+        self, file_id: uuid.UUID, *, extracted_text: str, doc_topic: str
+    ) -> int:
+        """PDF pipeline write: extracted text + denormalized topic in ONE
+        update — the generated search_vector recomputes in the same row
+        write (no second UPDATE ever touches it). Plain WHERE id: the caller
+        runs it while the row is processing; reprocessing writes the same
+        values (idempotent)."""
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(File)
+                .where(File.id == file_id)
+                .values(extracted_text=extracted_text, doc_topic=doc_topic)
             ),
         )
         return result.rowcount

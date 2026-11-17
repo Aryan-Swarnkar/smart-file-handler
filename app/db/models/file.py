@@ -146,4 +146,11 @@ class File(Base, CreatedAtMixin):
         nullable=True,
     )
 
-    labels: Mapped[list[FileLabel]] = relationship(back_populates="file")
+    # passive_deletes: file_labels.file_id is a composite-PK member — the
+    # ORM's default parent-delete behavior (SET NULL the child FK) is
+    # ILLEGAL here (AssertionError at flush, found by the live E2E's first
+    # delete of a labeled file). The FK's DB-level ON DELETE CASCADE removes
+    # the association rows instead; the per-user Label rows survive.
+    labels: Mapped[list[FileLabel]] = relationship(
+        back_populates="file", passive_deletes=True
+    )

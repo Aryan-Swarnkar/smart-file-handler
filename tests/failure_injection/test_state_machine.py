@@ -23,6 +23,7 @@ from tests.failure_injection.conftest import (
     run_task_body,
     seed_file,
     seed_user_with_quota,
+    tiny_png,
 )
 
 
@@ -36,7 +37,11 @@ async def status_of(db: AsyncSession, file_id: uuid.UUID) -> FileStatus | None:
 
 async def test_kill_between_steps_recovers_on_redelivery(db: AsyncSession) -> None:
     user = await seed_user_with_quota(db)
-    file = await seed_file(db, user, status=FileStatus.UPLOADED)
+    # Phase 7: the finishing delivery runs the REAL pipeline, so the stuck
+    # row needs real, decodable bytes behind it (sha256 mirrors /complete).
+    file = await seed_file(
+        db, user, status=FileStatus.UPLOADED, plant_object=True, data=tiny_png()
+    )
     await db.commit()
 
     # Simulate the kill: step 1 committed, process died before step 2.
@@ -55,7 +60,9 @@ async def test_kill_between_steps_recovers_on_redelivery(db: AsyncSession) -> No
 
 async def test_duplicate_delivery_processed_once(db: AsyncSession) -> None:
     user = await seed_user_with_quota(db)
-    file = await seed_file(db, user, status=FileStatus.UPLOADED)
+    file = await seed_file(
+        db, user, status=FileStatus.UPLOADED, plant_object=True, data=tiny_png()
+    )
     await db.commit()
 
     await tasks_module._drive_state_machine(file.id)

@@ -10,7 +10,9 @@ Local dev: SeaweedFS (S3 API compatible). Production: AWS S3 / Cloudflare R2
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aioboto3
@@ -246,6 +248,33 @@ class StorageService:
                 yield chunk
         finally:
             resp["Body"].close()
+
+    async def download_to_path(self, key: str, dest: Path) -> str | None:
+        """Stream the object body into `dest` while computing SHA-256.
+
+        Returns the digest, or None when the object does not exist (404
+        family — mapped by the caller to a deterministic failure; anything
+        else raises). One pass: hash + bytes land together, no re-GET.
+        """
+        import hashlib
+
+        digest = hashlib.sha256()
+        client = self._require_client()
+        try:
+            resp = await client.get_object(Bucket=self._bucket(), Key=key)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
+        try:
+            with dest.open("wb") as fh:
+                async for chunk in resp["Body"]:
+                    digest.update(chunk)
+                    await asyncio.to_thread(fh.write, chunk)
+        finally:
+            resp["Body"].close()
+        return digest.hexdigest()
 
     async def read_range(self, key: str, n: int) -> bytes:
         """First ≤n bytes via a ranged GET (Range header) — the sniff probe.

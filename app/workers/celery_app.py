@@ -14,7 +14,10 @@ outbox event_type -> task name, and the beat schedule references the sweep.
 
 from __future__ import annotations
 
+import asyncio
+
 from celery import Celery
+from celery.signals import worker_process_init
 
 from app.core.config import get_settings
 
@@ -64,3 +67,13 @@ def make_celery_app() -> Celery:
 
 
 celery_app = make_celery_app()
+
+
+@worker_process_init.connect
+def _warm_models(**_kwargs: object) -> None:
+    """Load ML models ONCE per worker process (pipelines/models_registry).
+    Stub mode: a logged no-op. Real mode: CLIP weights land in memory here,
+    not on the first task."""
+    from app.workers.pipelines import models_registry
+
+    asyncio.run(models_registry.warmup())

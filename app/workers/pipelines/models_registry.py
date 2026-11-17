@@ -105,12 +105,14 @@ class ClipRegistry:
     _model: Any = None
     _preprocess: Any = None
     _concept_features: Any = None  # normalized text embeddings
+    _logit_scale: float | None = None  # CLIP's learned temperature, cached
     _lock: asyncio.Lock | None = None
 
-    # TODO(verify-at-gated-run): open_clip API + model variant are verified
-    # against the INSTALLED versions during the explicit real-model checkpoint
-    # run (ML_STUB convention: never run alongside the full stack). The stub
-    # path below never executes this class.
+    # Verified at the gated real-model checkpoint run (2026-11-17, open_clip
+    # 4.2.2 / torch 2.15.0+cpu): the pairing is ViT-B-32-quickgelu + openai
+    # weights (plain ViT-B-32 warns of a QuickGELU mismatch and degrades);
+    # zero-shot MUST scale cosine logits by the learned logit_scale (~100)
+    # before softmax — see _ensure_loaded. peak RSS after load: ~1.5 GB.
 
     async def _ensure_loaded(self) -> tuple[Any, Any]:
         if self._model is not None:
@@ -122,10 +124,15 @@ class ClipRegistry:
                 return self._model, self._preprocess
             import open_clip  # deferred: optional `ml` dependency group
 
+            # "ViT-B-32-quickgelu" is the CANONICAL pairing for the OpenAI
+            # weights: plain "ViT-B-32" builds the model without QuickGELU and
+            # open_clip warns about the mismatch — confidences collapse (all
+            # concepts under the threshold in the checkpoint run). Verified
+            # against the installed version at the gated real-model run.
             model, _, preprocess = open_clip.create_model_and_transforms(
-                "ViT-B-32", pretrained="openai"
+                "ViT-B-32-quickgelu", pretrained="openai"
             )
-            tokenizer = open_clip.get_tokenizer("ViT-B-32")
+            tokenizer = open_clip.get_tokenizer("ViT-B-32-quickgelu")
             import torch  # deferred with open_clip
 
             device = "cpu"
@@ -139,8 +146,20 @@ class ClipRegistry:
                 )
             self._model = model
             self._preprocess = preprocess
+            # logit_scale: CLIP's LEARNED temperature (~100 for the OpenAI
+            # weights). Zero-shot softmax MUST scale the cosine logits by it —
+            # raw-cosine softmax is near-uniform over a 17-concept candidate
+            # list (top-1 ~0.06) and the confidence threshold would filter
+            # everything (found at the gated real-model run; the stub path
+            # never exercised this because stub confidences are hardcoded).
+            self._logit_scale = float(model.logit_scale.exp().item())
             self._concept_features = (text_features, device)
-            logger.info("clip_model_loaded", variant="ViT-B-32", device=device)
+            logger.info(
+                "clip_model_loaded",
+                variant="ViT-B-32-quickgelu",
+                device=device,
+                logit_scale=round(self._logit_scale, 2),
+            )
         return self._model, self._preprocess
 
     async def label_image(self, file_id: uuid.UUID, path: Path) -> ImageLabels:
@@ -159,7 +178,9 @@ class ClipRegistry:
             image_features = image_features / image_features.norm(
                 dim=-1, keepdim=True
             )
-            probs = (image_features @ text_features.T).softmax(dim=-1)[0]
+            assert self._logit_scale is not None
+            logits = (image_features @ text_features.T) * self._logit_scale
+            probs = logits.softmax(dim=-1)[0]
         pairs = [
             (concept, float(probs[i]))
             for i, concept in enumerate(IMAGE_CONCEPTS)
@@ -188,7 +209,9 @@ class ClipRegistry:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             doc_features = model.encode_text(tokenizer([sample]).to(device))
             doc_features = doc_features / doc_features.norm(dim=-1, keepdim=True)
-            probs = (doc_features @ text_features.T).softmax(dim=-1)[0]
+            assert self._logit_scale is not None
+            logits = (doc_features @ text_features.T) * self._logit_scale
+            probs = logits.softmax(dim=-1)[0]
         best = max(range(len(DOC_TOPICS)), key=lambda i: float(probs[i]))
         return DocumentTopic(topic=DOC_TOPICS[best], confidence=float(probs[best]))
 

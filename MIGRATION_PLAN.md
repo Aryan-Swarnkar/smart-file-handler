@@ -125,7 +125,7 @@ during the Phase 1 dependency sweep (cheap: read installed package metadata).
 | **packaging** | ADD (Phase 6) — celery 5.7.0 imports it but declares it nowhere; pinned explicitly | Apache-2.0 / BSD-2-Clause |
 | **Pillow** | ADD (Phase 7) — 13.0.0; header-probe bomb guard + `Image.MAX_IMAGE_PIXELS` | **MIT-CMU** (verified from the installed 13.0.0 LICENSE file; bundled binary deps are permissive: FTL/GPLv2-dual freetype, MIT/Old-MIT harfbuzz, MIT lcms2, BSD libavif/dav1d, Apache-2.0, zlib) |
 | **pymupdf** | ADD (Phase 7) — 2.1; `import pymupdf` (2.x canonical; `fitz` shim deprecated) | **AGPL-3.0 or Artifex Commercial** (verified from installed metadata) — acceptable per the user rule (separately-run worker container); flagged |
-| **open_clip** | ADD (Phase 7) — **optional `uv` dependency group `ml` only** (`uv sync --group ml`); never in the container image; real-model run is a separate gated step | MIT (code); **checkpoint weights' license verified at the gated real-model run before any real-model use** |
+| **open_clip** | ADD (Phase 7) — **optional `uv` dependency group `ml` only** (`uv sync --group ml`); never in the container image; gated real-model run DONE 2026-11-17 (PROGRESS.md checkpoint section: 2 real-path bugs found+fixed, peak 1.48 GB) | MIT (code); **checkpoint weights = OpenAI CLIP ViT-B/32, MIT per the official openai/CLIP repo (LICENSE + model card) — verified at the gated run via the HF timm/vit_base_patch32_clip_224.openai mirror** |
 | **opentelemetry-\*** | ADD (Phase 11) | Apache-2.0 |
 | **locust** | ADD (dev, Phase 12) | MIT |
 
